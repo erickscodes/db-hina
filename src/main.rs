@@ -30,6 +30,51 @@ struct HugeAlloc;
 
 extern "C" {
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+}
+
+const MADV_POPULATE_READ: i32 = 22;
+const MADV_POPULATE_WRITE: i32 = 23;
+
+/// Faults in [p, p+n) with one call (Linux 5.14+); harmless if unsupported.
+fn populate(p: *const u8, n: usize, write: bool) {
+    let a = p as usize & !4095;
+    let e = (p as usize + n + 4095) & !4095;
+    if e > a {
+        unsafe {
+            madvise(a as *mut u8, e - a, if write { MADV_POPULATE_WRITE } else { MADV_POPULATE_READ });
+        }
+    }
+}
+
+/// Maps a whole file read-only; None if empty or mmap fails.
+fn map_file(f: &File, size: u64) -> Option<&'static [u8]> {
+    use std::os::unix::io::AsRawFd;
+    if size == 0 {
+        return None;
+    }
+    let p = unsafe { mmap(std::ptr::null_mut(), size as usize, 1, 2, f.as_raw_fd(), 0) };
+    if p as isize == -1 || p.is_null() {
+        return None;
+    }
+    Some(unsafe { std::slice::from_raw_parts(p, size as usize) })
+}
+
+/// The lines starting in [start, end) of a mapped file, as (first line start,
+/// region end), if the region ends at least 64 bytes before the end of the
+/// file (so `scan` can over-read). The header line at offset 0 is skipped.
+fn map_chunk(m: &[u8], start: usize, end: usize) -> Option<(usize, usize)> {
+    let rs = start.saturating_sub(1);
+    let region_end = find_nl(m, end - 1)? + 1;
+    if region_end + 64 > m.len() {
+        return None;
+    }
+    populate(m[rs..].as_ptr(), region_end - rs, false);
+    let pos = match find_nl(&m[..region_end], rs) {
+        Some(i) => i + 1,
+        None => region_end,
+    };
+    Some((pos, region_end))
 }
 
 static HUGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -619,6 +664,7 @@ struct Parted<T: Copy> {
     chunks: Vec<Vec<T>>,
     chunk_cap: usize,
     used: usize,
+    populated: usize,
     /// Per partition: the open block (chunk, start, len).
     cur: Vec<(u32, u32, u32)>,
     done: Vec<Vec<(u32, u32, u32)>>,
@@ -627,7 +673,7 @@ struct Parted<T: Copy> {
 impl<T: Copy> Parted<T> {
     fn new(parts: usize, expect: usize) -> Self {
         let chunk_cap = (expect + parts * BLOCK as usize).max(BLOCK as usize * 4).div_ceil(BLOCK as usize) * BLOCK as usize;
-        Parted { chunks: Vec::new(), chunk_cap, used: chunk_cap, cur: vec![(0, 0, BLOCK); parts], done: vec![Vec::new(); parts] }
+        Parted { chunks: Vec::new(), chunk_cap, used: chunk_cap, populated: 0, cur: vec![(0, 0, BLOCK); parts], done: vec![Vec::new(); parts] }
     }
     #[inline(always)]
     fn push(&mut self, p: usize, v: T) {
@@ -636,6 +682,16 @@ impl<T: Copy> Parted<T> {
             if self.used == self.chunk_cap {
                 self.chunks.push(Vec::with_capacity(self.chunk_cap));
                 self.used = 0;
+                self.populated = 0;
+            }
+            if self.used + BLOCK as usize > self.populated {
+                // Fault in the next window in one call instead of page by page.
+                let window = ((4 << 20) / std::mem::size_of::<T>()).max(BLOCK as usize);
+                let upto = (self.populated + window).min(self.chunk_cap);
+                let base = self.chunks.last().unwrap().as_ptr();
+                let sz = std::mem::size_of::<T>();
+                populate(unsafe { base.add(self.populated) } as *const u8, (upto - self.populated) * sz, true);
+                self.populated = upto;
             }
             let nb = ((self.chunks.len() - 1) as u32, self.used as u32, 0);
             self.used += BLOCK as usize;
@@ -799,6 +855,22 @@ fn build_people(links: &[Vec<(u64, u64)>]) -> Map<u64> {
     pmap
 }
 
+#[repr(C)]
+struct RUsage {
+    utime: [i64; 2],
+    stime: [i64; 2],
+    rest: [i64; 14],
+}
+extern "C" {
+    fn getrusage(who: i32, usage: *mut RUsage) -> i32;
+}
+/// Process CPU seconds so far: (user, system).
+fn cpu_times() -> (f64, f64) {
+    let mut r = RUsage { utime: [0; 2], stime: [0; 2], rest: [0; 14] };
+    unsafe { getrusage(0, &mut r) };
+    (r.utime[0] as f64 + r.utime[1] as f64 * 1e-6, r.stime[0] as f64 + r.stime[1] as f64 * 1e-6)
+}
+
 // ---------------------------------------------------------------- main
 
 struct P1 {
@@ -854,7 +926,10 @@ fn main() {
     if std::env::var("HUGE").is_ok() {
         HUGE.store(true, AO::Relaxed);
     }
-    let log = |m: &str| eprintln!("[{:7.3}s] {m}", t0.elapsed().as_secs_f64());
+    let log = |m: &str| {
+        let (u, sy) = cpu_times();
+        eprintln!("[{:7.3}s user {:6.2} sys {:6.2}] {m}", t0.elapsed().as_secs_f64(), u, sy)
+    };
 
     // --- small inputs
     let manifest = std::fs::read_to_string(data.join("manifest.json")).expect("manifest");
@@ -898,14 +973,16 @@ fn main() {
     let ev_files = list_csv(&data.join("events"));
     let cl_files = list_csv(&data.join("clicks"));
     let ln_files = list_csv(&data.join("links"));
-    let mut files: Vec<(u8, File, u64)> = Vec::new();
+    let mut files: Vec<(u8, File, u64, Option<&'static [u8]>)> = Vec::new();
     let mut tasks: Vec<(usize, u64, u64)> = Vec::new();
     let (mut ev_bytes, mut cl_bytes) = (0u64, 0u64);
     let mut link_tasks = 0usize;
     for (kind, list) in [(2u8, &ln_files), (0u8, &ev_files), (1u8, &cl_files)] {
         for (p, size) in list {
             let fi = files.len();
-            files.push((kind, File::open(p).expect("open"), *size));
+            let f = File::open(p).expect("open");
+            let m = map_file(&f, *size);
+            files.push((kind, f, *size, m));
             match kind {
                 0 => ev_bytes += size,
                 1 => cl_bytes += size,
@@ -940,9 +1017,15 @@ fn main() {
         || P1 { ev: parted(NP, est_ev * 11 / 10 / w), cl: Vec::with_capacity(est_cl * 11 / 10 / w), buf: Vec::new() },
         |st, t| {
             let (fi, s, e) = tasks[t];
-            let (kind, ref file, size) = files[fi];
-            let mut buf = std::mem::take(&mut st.buf);
-            let (pos, end) = read_chunk(file, size, s, e, &mut buf);
+            let (kind, ref file, size, map) = files[fi];
+            let mut owned = std::mem::take(&mut st.buf);
+            let (buf, pos, end): (&[u8], usize, usize) = match map.and_then(|m| map_chunk(m, s as usize, e as usize).map(|r| (m, r))) {
+                Some((m, (pos, end))) => (m, pos, end),
+                None => {
+                    let (pos, end) = read_chunk(file, size, s, e, &mut owned);
+                    (&owned[..], pos, end)
+                }
+            };
             match kind {
                 0 => {
                     scan::<7>(&buf, pos, end, |f| {
@@ -1017,7 +1100,7 @@ fn main() {
                     }
                 }
             }
-            st.buf = buf;
+            st.buf = owned;
         },
     );
     let pmap = people.into_inner().expect("people built");
