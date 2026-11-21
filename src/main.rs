@@ -795,6 +795,111 @@ struct EvP {
 }
 const _: () = assert!(std::mem::size_of::<EvP>() == 24);
 
+/// How packed event records lay out (ts - ws, price, category) in one u64:
+/// ts offset in the high bits (so the word sorts by time), then 24 price bits,
+/// then `cbits` category bits. `fits` says the dataset's window and category
+/// count fit; otherwise the wide 24-byte records are used.
+#[derive(Clone, Copy)]
+struct Pack {
+    ws: i64,
+    cbits: u32,
+    fits: bool,
+}
+
+impl Pack {
+    fn new(ws: i64, we: i64, ncat: usize) -> Self {
+        let cbits = if ncat <= 1 { 0 } else { usize::BITS - (ncat - 1).leading_zeros() };
+        let tbits = 64 - 24 - cbits as i64;
+        let span = (we - ws).max(0) as u128;
+        let fits = cbits <= 16 && tbits > 0 && span < (1u128 << tbits);
+        Pack { ws, cbits, fits }
+    }
+}
+
+/// An event record in phases 2 and 3.
+trait Rec: Copy + Send + Sync + 'static {
+    /// `ts_rel` = ts - ws; `ph` = h64(person).
+    fn make(person: u64, ts_rel: u64, price: u32, cat: u16, ph: u64, pk: &Pack) -> Self;
+    fn person(&self) -> u64;
+    /// Increases with ts (ties broken arbitrarily).
+    fn tkey(&self) -> u64;
+    fn ts(&self, pk: &Pack) -> i64;
+    fn price(&self, pk: &Pack) -> u32;
+    fn cat(&self, pk: &Pack) -> u16;
+    /// Phase-3 sub-bucket of the person.
+    fn bk(&self) -> usize;
+}
+
+impl Rec for EvP {
+    #[inline(always)]
+    fn make(person: u64, ts_rel: u64, price: u32, cat: u16, ph: u64, pk: &Pack) -> Self {
+        EvP { person, ts: ts_rel as i64 + pk.ws, price, cat, bk: bucket_of(ph) }
+    }
+    #[inline(always)]
+    fn person(&self) -> u64 {
+        self.person
+    }
+    #[inline(always)]
+    fn tkey(&self) -> u64 {
+        (self.ts as u64) ^ (1 << 63)
+    }
+    #[inline(always)]
+    fn ts(&self, _: &Pack) -> i64 {
+        self.ts
+    }
+    #[inline(always)]
+    fn price(&self, _: &Pack) -> u32 {
+        self.price
+    }
+    #[inline(always)]
+    fn cat(&self, _: &Pack) -> u16 {
+        self.cat
+    }
+    #[inline(always)]
+    fn bk(&self) -> usize {
+        self.bk as usize
+    }
+}
+
+/// Packed 16-byte event record (see `Pack`).
+#[derive(Clone, Copy)]
+struct EvP16 {
+    person: u64,
+    packed: u64,
+}
+const _: () = assert!(std::mem::size_of::<EvP16>() == 16);
+
+impl Rec for EvP16 {
+    #[inline(always)]
+    fn make(person: u64, ts_rel: u64, price: u32, cat: u16, _ph: u64, pk: &Pack) -> Self {
+        EvP16 { person, packed: (ts_rel << (24 + pk.cbits)) | ((price as u64) << pk.cbits) | cat as u64 }
+    }
+    #[inline(always)]
+    fn person(&self) -> u64 {
+        self.person
+    }
+    #[inline(always)]
+    fn tkey(&self) -> u64 {
+        self.packed
+    }
+    #[inline(always)]
+    fn ts(&self, pk: &Pack) -> i64 {
+        (self.packed >> (24 + pk.cbits)) as i64 + pk.ws
+    }
+    #[inline(always)]
+    fn price(&self, pk: &Pack) -> u32 {
+        ((self.packed >> pk.cbits) & 0xFF_FFFF) as u32
+    }
+    #[inline(always)]
+    fn cat(&self, pk: &Pack) -> u16 {
+        (self.packed & ((1u64 << pk.cbits) - 1)) as u16
+    }
+    #[inline(always)]
+    fn bk(&self) -> usize {
+        bucket_of(h64(self.person)) as usize
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ClP {
     person: u64,
@@ -1252,8 +1357,8 @@ struct P1 {
     dc: DateCache,
 }
 
-struct P2 {
-    ev: Parted<EvP>,
+struct P2<E: Copy> {
+    ev: Parted<E>,
     cl: Parted<ClP>,
     blocks: Vec<(usize, u32)>,
     table: Vec<u64>,
@@ -1269,7 +1374,7 @@ struct UserRows {
     top: Vec<Option<u32>>,
 }
 
-struct P3 {
+struct P3<E> {
     acc: Vec<[i64; 4]>,
     counts: Vec<u32>,
     pos: Vec<u32>,
@@ -1277,7 +1382,7 @@ struct P3 {
     catsum: Vec<i64>,
     touched: Vec<u16>,
     rows: usize,
-    ev: Vec<EvP>,
+    ev: Vec<E>,
     cl: Vec<ClP>,
     counts_ev: Vec<u32>,
     counts_cl: Vec<u32>,
@@ -1499,6 +1604,43 @@ fn main() {
     let click_regions: Vec<(usize, usize)> = p1s.iter().map(|p| (p.cl.as_ptr() as usize, p.cl.capacity() * std::mem::size_of::<ClickRaw>())).collect();
     log("parsed and linked");
 
+    let pk = Pack::new(ws, we, cat_names.len());
+    let args = Phase23 { t0, w, ws, we, est_ev, est_cl, p1s, pmap, map_pieces, click_regions, ncamp, cat_names, camp_names, camp_channels, output };
+    if pk.fits && std::env::var("FORCE_WIDE").is_err() {
+        log("event records: packed 16 bytes");
+        phases23::<EvP16>(args, pk)
+    } else {
+        log("event records: wide 24 bytes");
+        phases23::<EvP>(args, pk)
+    }
+}
+
+/// Everything phases 2 and 3 need from main.
+struct Phase23 {
+    t0: Instant,
+    w: usize,
+    ws: i64,
+    we: i64,
+    est_ev: usize,
+    est_cl: usize,
+    p1s: Vec<P1>,
+    pmap: People,
+    map_pieces: Vec<(usize, usize)>,
+    click_regions: Vec<(usize, usize)>,
+    ncamp: usize,
+    cat_names: Vec<Vec<u8>>,
+    camp_names: Vec<Vec<u8>>,
+    camp_channels: Vec<Vec<u8>>,
+    output: PathBuf,
+}
+
+/// Phases 2 and 3 with event records of type E (packed or wide).
+fn phases23<E: Rec>(a: Phase23, pk: Pack) -> ! {
+    let Phase23 { t0, w, ws, we, est_ev, est_cl, p1s, pmap, map_pieces, click_regions, ncamp, cat_names, camp_names, camp_channels, output } = a;
+    let log = |m: &str| {
+        let (u, sy) = cpu_times();
+        eprintln!("[{:7.3}s user {:6.2} sys {:6.2}] {m}", t0.elapsed().as_secs_f64(), u, sy)
+    };
     // --- phase 2: dedup events, map to people, partition by person
     let ncl_chunks: Vec<(usize, usize, usize)> = {
         let mut v = Vec::new();
@@ -1515,7 +1657,7 @@ fn main() {
     let p2s = run_par(
         w,
         NP + ncl_chunks.len() + map_pieces.len(),
-        || P2 { ev: parted(NQ, est_ev / w), cl: parted(NQ, est_cl * 11 / 10 / w), blocks: Vec::new(), table: Vec::new() },
+        || P2::<E> { ev: parted(NQ, est_ev / w), cl: parted(NQ, est_cl * 11 / 10 / w), blocks: Vec::new(), table: Vec::new() },
         |st, t| {
             if t < NP {
                 let tt = Instant::now();
@@ -1614,7 +1756,7 @@ fn main() {
                         let r = blk[idx[i] as usize];
                         let (person, ph) = pmap.person_h(r.user, h);
                         let q = (ph >> (64 - NQ_BITS)) as usize;
-                        st.ev.push(q, EvP { person, ts: (r.tsc & TS_MASK) as i64 + ws, price: (r.ip & 0xFF_FFFF) as u32, cat: (r.tsc >> 48) as u16, bk: bucket_of(ph) });
+                        st.ev.push(q, E::make(person, r.tsc & TS_MASK, (r.ip & 0xFF_FFFF) as u32, (r.tsc >> 48) as u16, ph, &pk));
                     }
                 }
                 // Partition t is consumed; its blocks can hold phase-2 output.
@@ -1684,7 +1826,7 @@ fn main() {
     let p3s = run_par(
         w,
         NQ + late_pieces.len(),
-        || P3 {
+        || P3::<E> {
             acc: vec![[0i64; 4]; (ncamp + 1) * ndays],
             counts: vec![0; ncamp],
             pos: vec![0; ncamp],
@@ -1713,7 +1855,7 @@ fn main() {
             // Gather by a counting sort on further person-hash bits, then sort
             // each small bucket exactly by (person, ts). People end up ordered by
             // (bucket, person), the same for events and clicks.
-            bucket_gather(&p2s, q, |p| &p.ev, |e| e.bk as usize, &mut ev, &mut st.counts_ev);
+            bucket_gather(&p2s, q, |p| &p.ev, |e| e.bk(), &mut ev, &mut st.counts_ev);
             bucket_gather(&p2s, q, |p| &p.cl, |c| c.bk as usize, &mut cl, &mut st.counts_cl);
             // Partition q is copied out: its blocks are dead.
             for p in &p2s {
@@ -1721,7 +1863,7 @@ fn main() {
                 p.cl.release_partition(q);
             }
             for w in st.counts_ev.windows(2) {
-                ev[w[0] as usize..w[1] as usize].sort_unstable_by(|a, b| a.person.cmp(&b.person).then(a.ts.cmp(&b.ts)));
+                ev[w[0] as usize..w[1] as usize].sort_unstable_by(|a, b| a.person().cmp(&b.person()).then(a.tkey().cmp(&b.tkey())));
             }
             for w in st.counts_cl.windows(2) {
                 cl[w[0] as usize..w[1] as usize].sort_unstable_by(|a, b| a.person.cmp(&b.person).then(a.ts.cmp(&b.ts)));
@@ -1730,20 +1872,20 @@ fn main() {
             let mut ci = 0usize;
             let mut i = 0usize;
             while i < ev.len() {
-                let person = ev[i].person;
+                let person = ev[i].person();
                 let mut j = i + 1;
-                while j < ev.len() && ev[j].person == person {
+                while j < ev.len() && ev[j].person() == person {
                     j += 1;
                 }
-                let pk = (ev[i].bk, person);
-                while ci < cl.len() && (cl[ci].bk, cl[ci].person) < pk {
+                let key = (ev[i].bk() as u16, person);
+                while ci < cl.len() && (cl[ci].bk, cl[ci].person) < key {
                     ci += 1;
                 }
                 let cs = ci;
                 while ci < cl.len() && cl[ci].person == person {
                     ci += 1;
                 }
-                walk_person(person, &ev[i..j], &cl[cs..ci], st, ncamp, ndays, day0, &mut rows);
+                walk_person(person, &ev[i..j], &cl[cs..ci], st, ncamp, ndays, day0, &mut rows, &pk);
                 i = j;
             }
             st.ev = ev;
@@ -1825,7 +1967,7 @@ fn main() {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn walk_person(person: u64, evs: &[EvP], cls: &[ClP], st: &mut P3, ncamp: usize, ndays: usize, day0: i64, rows: &mut UserRows) {
+fn walk_person<E: Rec>(person: u64, evs: &[E], cls: &[ClP], st: &mut P3<E>, ncamp: usize, ndays: usize, day0: i64, rows: &mut UserRows, pk: &Pack) {
     let mut lo = 0usize;
     let mut hi = 0usize;
     let mut k = 0usize;
@@ -1857,7 +1999,7 @@ fn walk_person(person: u64, evs: &[EvP], cls: &[ClP], st: &mut P3, ncamp: usize,
         };
     }
     while k < evs.len() {
-        let start = evs[k].ts;
+        let start = evs[k].ts(pk);
         let day = start.div_euclid(DAY);
         if day != cur_day {
             flush!();
@@ -1870,17 +2012,19 @@ fn walk_person(person: u64, evs: &[EvP], cls: &[ClP], st: &mut P3, ncamp: usize,
         let mut m = k;
         let mut rev = 0i64;
         let mut purch = false;
-        while m < evs.len() && evs[m].ts - last <= GAP {
+        while m < evs.len() && evs[m].ts(pk) - last <= GAP {
             let e = &evs[m];
-            last = e.ts;
-            if e.price != 0 {
-                rev += e.price as i64;
+            last = e.ts(pk);
+            let price = e.price(pk);
+            if price != 0 {
+                rev += price as i64;
                 purch = true;
-                let c = e.cat as usize;
+                let ecat = e.cat(pk);
+                let c = ecat as usize;
                 if st.catsum[c] == 0 {
-                    st.touched.push(e.cat);
+                    st.touched.push(ecat);
                 }
-                st.catsum[c] += e.price as i64;
+                st.catsum[c] += price as i64;
             }
             m += 1;
         }
