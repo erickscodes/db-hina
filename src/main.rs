@@ -1035,6 +1035,49 @@ fn cpu_times() -> (f64, f64) {
     (r.utime[0] as f64 + r.utime[1] as f64 * 1e-6, r.stime[0] as f64 + r.stime[1] as f64 * 1e-6)
 }
 
+const SUB_BITS: u32 = 12;
+
+/// The bucket of a person inside its phase-3 partition: the hash bits right
+/// below the ones that chose the partition.
+#[inline(always)]
+fn sub_bucket(person: u64) -> usize {
+    ((h64(person) >> (64 - NQ_BITS - SUB_BITS)) & ((1 << SUB_BITS) - 1)) as usize
+}
+
+/// Copies partition q of every worker's `Parted` into `out`, grouped by
+/// `sub_bucket`; `bounds` gets the bucket boundaries (len = buckets + 1).
+fn bucket_gather<P, T: Copy>(src: &[P], q: usize, get: impl Fn(&P) -> &Parted<T>, person: impl Fn(&T) -> u64, out: &mut Vec<T>, bounds: &mut Vec<u32>) {
+    let nb = 1usize << SUB_BITS;
+    bounds.clear();
+    bounds.resize(nb + 1, 0);
+    for p in src {
+        get(p).for_each_slice(q, |s| {
+            for r in s {
+                bounds[sub_bucket(person(r)) + 1] += 1;
+            }
+        });
+    }
+    for b in 1..=nb {
+        bounds[b] += bounds[b - 1];
+    }
+    let n = bounds[nb] as usize;
+    out.clear();
+    out.reserve(n);
+    let mut at: Vec<u32> = bounds[..nb].to_vec();
+    let dst = out.as_mut_ptr();
+    for p in src {
+        get(p).for_each_slice(q, |s| {
+            for r in s {
+                let b = sub_bucket(person(r));
+                unsafe { dst.add(at[b] as usize).write(*r) };
+                at[b] += 1;
+            }
+        });
+    }
+    // Every slot in 0..n was written exactly once above.
+    unsafe { out.set_len(n) };
+}
+
 // ---------------------------------------------------------------- main
 
 struct P1 {
@@ -1073,6 +1116,8 @@ struct P3 {
     rows: usize,
     ev: Vec<EvP>,
     cl: Vec<ClP>,
+    counts_ev: Vec<u32>,
+    counts_cl: Vec<u32>,
 }
 
 static PT: [AtomicUsize; 5] = [AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0)];
@@ -1423,19 +1468,24 @@ fn main() {
             rows: 0,
             ev: Vec::new(),
             cl: Vec::new(),
+            counts_ev: Vec::new(),
+            counts_cl: Vec::new(),
         },
         |st, t| {
             let q = order[t];
             let mut ev = std::mem::take(&mut st.ev);
             let mut cl = std::mem::take(&mut st.cl);
-            ev.clear();
-            cl.clear();
-            for p in &p2s {
-                p.ev.for_each_slice(q, |s| ev.extend_from_slice(s));
-                p.cl.for_each_slice(q, |s| cl.extend_from_slice(s));
+            // Gather by a counting sort on further person-hash bits, then sort
+            // each small bucket exactly by (person, ts). People end up ordered by
+            // (bucket, person), the same for events and clicks.
+            bucket_gather(&p2s, q, |p| &p.ev, |e| e.person, &mut ev, &mut st.counts_ev);
+            bucket_gather(&p2s, q, |p| &p.cl, |c| c.person, &mut cl, &mut st.counts_cl);
+            for w in st.counts_ev.windows(2) {
+                ev[w[0] as usize..w[1] as usize].sort_unstable_by(|a, b| a.person.cmp(&b.person).then(a.ts.cmp(&b.ts)));
             }
-            ev.sort_unstable_by(|a, b| a.person.cmp(&b.person).then(a.ts.cmp(&b.ts)));
-            cl.sort_unstable_by(|a, b| a.person.cmp(&b.person).then(a.ts.cmp(&b.ts)));
+            for w in st.counts_cl.windows(2) {
+                cl[w[0] as usize..w[1] as usize].sort_unstable_by(|a, b| a.person.cmp(&b.person).then(a.ts.cmp(&b.ts)));
+            }
             let mut rows = UserRows { name: Vec::new(), day: Vec::new(), sessions: Vec::new(), events: Vec::new(), revenue: Vec::new(), top: Vec::new() };
             let mut ci = 0usize;
             let mut i = 0usize;
@@ -1445,7 +1495,8 @@ fn main() {
                 while j < ev.len() && ev[j].person == person {
                     j += 1;
                 }
-                while ci < cl.len() && cl[ci].person < person {
+                let pk = (sub_bucket(person), person);
+                while ci < cl.len() && (sub_bucket(cl[ci].person), cl[ci].person) < pk {
                     ci += 1;
                 }
                 let cs = ci;
