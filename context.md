@@ -13,7 +13,7 @@ Read this first if you are picking up the work without the original chat.
 | Commit | What | Scorer time (20M practice) |
 |---|---|---|
 | `2fb8e19` | AVX2 CSV scanner on top of `8dc5783` | **1.66 s** (3rd place at the time; leader 1.52 s) |
-| `<next>` | exact 8-byte IDs (fast path for `[0-9A-Z_a-z]{1,9}`, exact intern table otherwise), dedup prefetch, huge pages off by default | not yet scored (local CPU -22% vs `415479e`; 60M events: ~15 s locally) |
+| `619fc1a` | exact 8-byte IDs (fast path for `[0-9A-Z_a-z]{1,9}`, exact intern table otherwise), dedup prefetch, huge pages off by default | not yet scored (local CPU -22% vs `415479e`; 60M events: ~15 s locally) |
 | Baseline (PySpark starter) | | 171.91 s |
 
 ## Design (src/main.rs, src/parquet.rs) — one dependency-free Rust binary
