@@ -827,6 +827,14 @@ impl<T: Copy> Parted<T> {
             f(unsafe { std::slice::from_raw_parts(c.0, c.1 as usize) });
         }
     }
+    /// Appends partition p's blocks as (address, records).
+    fn raw_blocks(&self, p: usize, out: &mut Vec<(usize, u32)>) {
+        out.extend(self.done[p].iter().map(|&b| (b as usize, self.cap)));
+        let c = self.cur[p];
+        if !c.0.is_null() {
+            out.push((c.0 as usize, c.1));
+        }
+    }
     /// Hands partition p's blocks to `POOL`. The caller must not read them again.
     fn recycle(&self, p: usize) {
         let mut g = POOL.lock().unwrap();
@@ -1096,9 +1104,8 @@ struct P1 {
 struct P2 {
     ev: Parted<EvP>,
     cl: Parted<ClP>,
-    recs: Vec<EvRaw>,
+    blocks: Vec<(usize, u32)>,
     table: Vec<u64>,
-    keep: Vec<u8>,
     surv: Vec<EvRaw>,
 }
 
@@ -1342,72 +1349,85 @@ fn main() {
     let p2s = run_par(
         w,
         NP + ncl_chunks.len(),
-        || P2 { ev: parted(NQ, est_ev / w), cl: parted(NQ, est_cl * 11 / 10 / w), recs: Vec::new(), table: Vec::new(), keep: Vec::new(), surv: Vec::new() },
+        || P2 { ev: parted(NQ, est_ev / w), cl: parted(NQ, est_cl * 11 / 10 / w), blocks: Vec::new(), table: Vec::new(), surv: Vec::new() },
         |st, t| {
             if t < NP {
                 let tt = Instant::now();
-                let recs = &mut st.recs;
-                recs.clear();
+                // Dedup in place, over the phase-1 blocks of partition t (no copy).
+                // Only this task touches partition t, so it owns these blocks.
+                // A losing copy gets user = 0 (the same mark as an invalid row).
+                const _: () = assert!(std::mem::size_of::<EvRaw>() * 1024 == BLOCK_BYTES);
+                let blocks = &mut st.blocks;
+                blocks.clear();
                 for p in &p1s {
-                    p.ev.for_each_slice(t, |s| recs.extend_from_slice(s));
+                    p.ev.raw_blocks(t, blocks);
                 }
-                // Partition t is copied out; its blocks can hold phase-2 output.
-                for p in &p1s {
-                    p.ev.recycle(t);
-                }
-                let n = recs.len();
+                let n: usize = blocks.iter().map(|b| b.1 as usize).sum();
                 PT[0].fetch_add(tt.elapsed().as_nanos() as usize, AO::Relaxed);
                 let tt = Instant::now();
                 let cap = (n * 2).max(16).next_power_of_two();
                 let mask = cap - 1;
-                // Each slot: hash fingerprint (high 32 bits) and record index + 1.
+                // Each slot: hash fingerprint (high 32 bits) and location + 1,
+                // location = block index << 10 | offset in block.
                 let table = &mut st.table;
                 table.clear();
                 table.resize(cap, 0);
-                let keep = &mut st.keep;
-                keep.clear();
-                keep.resize(n, 0);
                 const DAHEAD: usize = 16;
-                for i in 0..n {
-                    if i + DAHEAD < n {
-                        let hs = h64(recs[i + DAHEAD].eid) as usize & mask;
-                        unsafe { core::arch::x86_64::_mm_prefetch(table.as_ptr().add(hs) as *const i8, core::arch::x86_64::_MM_HINT_T0) };
-                    }
-                    let r = &recs[i];
-                    let id = i as u64 + 1;
-                    let h = h64(r.eid);
-                    let fp = h & 0xFFFF_FFFF_0000_0000;
-                    let mut s = h as usize & mask;
-                    loop {
-                        let cur = table[s];
-                        if cur == 0 {
-                            table[s] = fp | id;
-                            keep[i] = 1;
-                            break;
-                        }
-                        if cur & 0xFFFF_FFFF_0000_0000 == fp {
-                            let ci = (cur & 0xFFFF_FFFF) as usize - 1;
-                            let c = &recs[ci];
-                            if c.eid == r.eid {
-                                if (r.ip >> 24) < (c.ip >> 24) {
-                                    table[s] = fp | id;
-                                    keep[ci] = 0;
-                                    keep[i] = 1;
+                for (bi, &(bp, bl)) in blocks.iter().enumerate() {
+                    let bp = bp as *mut EvRaw;
+                    let bl = bl as usize;
+                    for o in 0..bl {
+                        unsafe {
+                            if o + DAHEAD < bl {
+                                let hs = h64((*bp.add(o + DAHEAD)).eid) as usize & mask;
+                                core::arch::x86_64::_mm_prefetch(table.as_ptr().add(hs) as *const i8, core::arch::x86_64::_MM_HINT_T0);
+                            }
+                            let r = bp.add(o);
+                            let eid = (*r).eid;
+                            let ing = (*r).ip >> 24;
+                            let loc = ((bi << 10) | o) as u64 + 1;
+                            let h = h64(eid);
+                            let fp = h & 0xFFFF_FFFF_0000_0000;
+                            let mut sl = h as usize & mask;
+                            loop {
+                                let cur = table[sl];
+                                if cur == 0 {
+                                    table[sl] = fp | loc;
+                                    break;
                                 }
-                                break;
+                                if cur & 0xFFFF_FFFF_0000_0000 == fp {
+                                    let cl = (cur & 0xFFFF_FFFF) - 1;
+                                    let c = (blocks[(cl >> 10) as usize].0 as *mut EvRaw).add((cl & 1023) as usize);
+                                    if (*c).eid == eid {
+                                        if ing < (*c).ip >> 24 {
+                                            table[sl] = fp | loc;
+                                            (*c).user = 0;
+                                        } else {
+                                            (*r).user = 0;
+                                        }
+                                        break;
+                                    }
+                                }
+                                sl = (sl + 1) & mask;
                             }
                         }
-                        s = (s + 1) & mask;
                     }
                 }
                 PT[1].fetch_add(tt.elapsed().as_nanos() as usize, AO::Relaxed);
                 let tt = Instant::now();
                 let surv = &mut st.surv;
                 surv.clear();
-                for (r, &k) in recs.iter().zip(keep.iter()) {
-                    if k != 0 && r.user != 0 {
-                        surv.push(*r);
+                for &(bp, bl) in blocks.iter() {
+                    let blk = unsafe { std::slice::from_raw_parts(bp as *const EvRaw, bl as usize) };
+                    for r in blk {
+                        if r.user != 0 {
+                            surv.push(*r);
+                        }
                     }
+                }
+                // Partition t is consumed; its blocks can hold phase-2 output.
+                for p in &p1s {
+                    p.ev.recycle(t);
                 }
                 PT[2].fetch_add(tt.elapsed().as_nanos() as usize, AO::Relaxed);
                 let tt = Instant::now();
