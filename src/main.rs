@@ -256,6 +256,30 @@ impl<V: Copy + Default> Map<V> {
         }
     }
     #[inline(always)]
+    fn get_h(&self, k: u64, h: u64) -> Option<V> {
+        if k == 0 {
+            return None;
+        }
+        let mut i = h as usize & self.mask;
+        loop {
+            let (kk, v) = unsafe { *self.s.get_unchecked(i) };
+            if kk == k {
+                return Some(v);
+            }
+            if kk == 0 {
+                return None;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+    #[inline(always)]
+    fn prefetch_h(&self, h: u64) {
+        let i = h as usize & self.mask;
+        unsafe {
+            core::arch::x86_64::_mm_prefetch(self.s.as_ptr().add(i) as *const i8, core::arch::x86_64::_MM_HINT_T0);
+        }
+    }
+    #[inline(always)]
     fn prefetch(&self, k: u64) {
         let i = h64(k) as usize & self.mask;
         unsafe {
@@ -886,8 +910,44 @@ fn list_csv(dir: &Path) -> Vec<(PathBuf, u64)> {
 
 // ---------------------------------------------------------------- linking
 
-/// Union-find over every linked ID; returns ID -> person name (smallest ID).
-fn build_people(links: &[Vec<(u64, u64)>]) -> Map<u64> {
+/// ID -> person name, for the IDs whose name is a different ID. Every other
+/// ID (unlinked, or the smallest of its person) is its own name. A blocked
+/// Bloom filter in front rejects most such IDs without touching the table.
+struct People {
+    map: Map<u64>,
+    bloom: Vec<u64>,
+    shift: u32,
+}
+
+impl People {
+    #[inline(always)]
+    fn bits(h: u64) -> u64 {
+        (1u64 << (h & 63)) | (1u64 << ((h >> 6) & 63))
+    }
+    #[inline(always)]
+    fn maybe(&self, h: u64) -> bool {
+        let b = Self::bits(h);
+        unsafe { *self.bloom.get_unchecked((h >> self.shift) as usize) & b == b }
+    }
+    #[inline(always)]
+    fn prefetch(&self, k: u64) {
+        let h = h64(k);
+        if self.maybe(h) {
+            self.map.prefetch_h(h);
+        }
+    }
+    #[inline(always)]
+    fn person(&self, k: u64) -> u64 {
+        let h = h64(k);
+        if !self.maybe(h) {
+            return k;
+        }
+        self.map.get_h(k, h).unwrap_or(k)
+    }
+}
+
+/// Union-find over every linked ID; names each person by its smallest ID.
+fn build_people(links: &[Vec<(u64, u64)>]) -> People {
     let npairs: usize = links.iter().map(|l| l.len()).sum();
     let mut pmap = Map::<u64>::new(npairs + 16);
     let mut ids: Vec<u64> = Vec::with_capacity(npairs);
@@ -927,12 +987,20 @@ fn build_people(links: &[Vec<(u64, u64)>]) -> Map<u64> {
             name[r] = ids[i];
         }
     }
-    for slot in pmap.s.iter_mut() {
-        if slot.0 != 0 {
-            slot.1 = name[roots[slot.1 as usize] as usize];
-        }
+    let renamed: Vec<(u64, u64)> = (0..ids.len()).map(|i| (ids[i], name[roots[i] as usize])).filter(|&(k, n)| k != n).collect();
+    drop(pmap);
+    let mut map = Map::<u64>::new(renamed.len() + 16);
+    // About 16 bits per entry, at least 1024 words.
+    let words = (renamed.len() / 4).max(1024).next_power_of_two();
+    let mut bloom = vec![0u64; words];
+    let shift = 64 - words.trailing_zeros();
+    for &(k, n) in &renamed {
+        let (s, _) = map.slot(k);
+        map.s[s].1 = n;
+        let h = h64(k);
+        bloom[(h >> shift) as usize] |= People::bits(h);
     }
-    pmap
+    People { map, bloom, shift }
 }
 
 #[repr(C)]
@@ -1088,9 +1156,9 @@ fn main() {
     // --- phase 1: parse (and link)
     let links_store: Mutex<Vec<Vec<(u64, u64)>>> = Mutex::new(Vec::new());
     let links_left = AtomicUsize::new(link_tasks);
-    let people: OnceLock<Map<u64>> = OnceLock::new();
+    let people: OnceLock<People> = OnceLock::new();
     if link_tasks == 0 {
-        let _ = people.set(Map::new(0));
+        let _ = people.set(build_people(&[]));
     }
     let ws_s = ws.div_euclid(1000);
     let p1s = run_par(
@@ -1280,7 +1348,7 @@ fn main() {
                         pmap.prefetch(surv[i + AHEAD].user);
                     }
                     let r = surv[i];
-                    let person = pmap.get(r.user).unwrap_or(r.user);
+                    let person = pmap.person(r.user);
                     let q = (h64(person) >> (64 - NQ_BITS)) as usize;
                     st.ev.push(q, EvP { person, ts: (r.tsc & TS_MASK) as i64 + ws, price: r.ip as u32, cat: (r.tsc >> 48) as u16 });
                 }
@@ -1295,7 +1363,7 @@ fn main() {
                         pmap.prefetch(cl[i + AHEAD].user);
                     }
                     let c = cl[i];
-                    let person = pmap.get(c.user).unwrap_or(c.user);
+                    let person = pmap.person(c.user);
                     let q = (h64(person) >> (64 - NQ_BITS)) as usize;
                     st.cl.push(q, ClP { person, cid: c.cid, ts: c.ts, camp: c.camp });
                 }
