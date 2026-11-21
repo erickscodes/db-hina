@@ -789,7 +789,10 @@ struct EvP {
     ts: i64,
     price: u32,
     cat: u16,
+    /// Phase-3 sub-bucket of `person` (see `bucket_of`), cached in padding.
+    bk: u16,
 }
+const _: () = assert!(std::mem::size_of::<EvP>() == 24);
 
 #[derive(Clone, Copy)]
 struct ClP {
@@ -797,7 +800,9 @@ struct ClP {
     cid: u64,
     ts: i64,
     camp: u32,
+    bk: u16,
 }
+const _: () = assert!(std::mem::size_of::<ClP>() == 32);
 
 struct Ctx {
     ws: i64,
@@ -1133,20 +1138,26 @@ const SUB_BITS: u32 = 12;
 /// The bucket of a person inside its phase-3 partition: the hash bits right
 /// below the ones that chose the partition.
 #[inline(always)]
+fn bucket_of(person_hash: u64) -> u16 {
+    ((person_hash >> (64 - NQ_BITS - SUB_BITS)) & ((1 << SUB_BITS) - 1)) as u16
+}
+
+#[inline(always)]
+#[allow(dead_code)]
 fn sub_bucket(person: u64) -> usize {
     ((h64(person) >> (64 - NQ_BITS - SUB_BITS)) & ((1 << SUB_BITS) - 1)) as usize
 }
 
 /// Copies partition q of every worker's `Parted` into `out`, grouped by
 /// `sub_bucket`; `bounds` gets the bucket boundaries (len = buckets + 1).
-fn bucket_gather<P, T: Copy>(src: &[P], q: usize, get: impl Fn(&P) -> &Parted<T>, person: impl Fn(&T) -> u64, out: &mut Vec<T>, bounds: &mut Vec<u32>) {
+fn bucket_gather<P, T: Copy>(src: &[P], q: usize, get: impl Fn(&P) -> &Parted<T>, bucket: impl Fn(&T) -> usize, out: &mut Vec<T>, bounds: &mut Vec<u32>) {
     let nb = 1usize << SUB_BITS;
     bounds.clear();
     bounds.resize(nb + 1, 0);
     for p in src {
         get(p).for_each_slice(q, |s| {
             for r in s {
-                bounds[sub_bucket(person(r)) + 1] += 1;
+                bounds[bucket(r) + 1] += 1;
             }
         });
     }
@@ -1161,7 +1172,7 @@ fn bucket_gather<P, T: Copy>(src: &[P], q: usize, get: impl Fn(&P) -> &Parted<T>
     for p in src {
         get(p).for_each_slice(q, |s| {
             for r in s {
-                let b = sub_bucket(person(r));
+                let b = bucket(r);
                 unsafe { dst.add(at[b] as usize).write(*r) };
                 at[b] += 1;
             }
@@ -1185,7 +1196,6 @@ struct P2 {
     cl: Parted<ClP>,
     blocks: Vec<(usize, u32)>,
     table: Vec<u64>,
-    surv: Vec<EvRaw>,
 }
 
 struct UserRows {
@@ -1441,7 +1451,7 @@ fn main() {
     let p2s = run_par(
         w,
         NP + ncl_chunks.len(),
-        || P2 { ev: parted(NQ, est_ev / w), cl: parted(NQ, est_cl * 11 / 10 / w), blocks: Vec::new(), table: Vec::new(), surv: Vec::new() },
+        || P2 { ev: parted(NQ, est_ev / w), cl: parted(NQ, est_cl * 11 / 10 / w), blocks: Vec::new(), table: Vec::new() },
         |st, t| {
             if t < NP {
                 let tt = Instant::now();
@@ -1507,45 +1517,45 @@ fn main() {
                 }
                 PT[1].fetch_add(tt.elapsed().as_nanos() as usize, AO::Relaxed);
                 let tt = Instant::now();
-                let surv = &mut st.surv;
-                surv.clear();
+                PT[2].fetch_add(tt.elapsed().as_nanos() as usize, AO::Relaxed);
+                let tt = Instant::now();
+                // Survivors go straight from their phase-1 block to the person
+                // partition (no survivor copy). Per block: list survivor offsets,
+                // then run the hash-once prefetch pipeline over them.
+                const FAR: usize = 32;
+                const NEAR: usize = 16;
+                let mut idx = [0u16; 1024];
                 for &(bp, bl) in blocks.iter() {
                     let blk = unsafe { std::slice::from_raw_parts(bp as *const EvRaw, bl as usize) };
-                    for r in blk {
-                        if r.user != 0 {
-                            surv.push(*r);
+                    let mut m = 0usize;
+                    for (o, r) in blk.iter().enumerate() {
+                        idx[m] = o as u16;
+                        m += (r.user != 0) as usize;
+                    }
+                    let mut ring = [0u64; FAR];
+                    for i in 0..FAR.min(m) {
+                        ring[i] = h64(blk[idx[i] as usize].user);
+                        pmap.prefetch_bloom_h(ring[i]);
+                    }
+                    for i in 0..m {
+                        let h = ring[i % FAR];
+                        if i + FAR < m {
+                            let hf = h64(blk[idx[i + FAR] as usize].user);
+                            ring[i % FAR] = hf;
+                            pmap.prefetch_bloom_h(hf);
                         }
+                        if i + NEAR < m {
+                            pmap.prefetch_h(ring[(i + NEAR) % FAR]);
+                        }
+                        let r = blk[idx[i] as usize];
+                        let (person, ph) = pmap.person_h(r.user, h);
+                        let q = (ph >> (64 - NQ_BITS)) as usize;
+                        st.ev.push(q, EvP { person, ts: (r.tsc & TS_MASK) as i64 + ws, price: (r.ip & 0xFF_FFFF) as u32, cat: (r.tsc >> 48) as u16, bk: bucket_of(ph) });
                     }
                 }
                 // Partition t is consumed; its blocks can hold phase-2 output.
                 for p in &p1s {
                     p.ev.recycle(t);
-                }
-                PT[2].fetch_add(tt.elapsed().as_nanos() as usize, AO::Relaxed);
-                let tt = Instant::now();
-                const FAR: usize = 32;
-                const NEAR: usize = 16;
-                // Each user is hashed once: a ring keeps hashes from the far stage.
-                let n = surv.len();
-                let mut ring = [0u64; FAR];
-                for i in 0..FAR.min(n) {
-                    ring[i] = h64(surv[i].user);
-                    pmap.prefetch_bloom_h(ring[i]);
-                }
-                for i in 0..n {
-                    let h = ring[i % FAR];
-                    if i + FAR < n {
-                        let hf = h64(surv[i + FAR].user);
-                        ring[i % FAR] = hf;
-                        pmap.prefetch_bloom_h(hf);
-                    }
-                    if i + NEAR < n {
-                        pmap.prefetch_h(ring[(i + NEAR) % FAR]);
-                    }
-                    let r = surv[i];
-                    let (person, ph) = pmap.person_h(r.user, h);
-                    let q = (ph >> (64 - NQ_BITS)) as usize;
-                    st.ev.push(q, EvP { person, ts: (r.tsc & TS_MASK) as i64 + ws, price: (r.ip & 0xFF_FFFF) as u32, cat: (r.tsc >> 48) as u16 });
                 }
                 PT[3].fetch_add(tt.elapsed().as_nanos() as usize, AO::Relaxed);
             } else {
@@ -1574,7 +1584,7 @@ fn main() {
                     let c = cl[i];
                     let (person, ph) = pmap.person_h(c.user, h);
                     let q = (ph >> (64 - NQ_BITS)) as usize;
-                    st.cl.push(q, ClP { person, cid: c.cid, ts: c.ts, camp: c.camp });
+                    st.cl.push(q, ClP { person, cid: c.cid, ts: c.ts, camp: c.camp, bk: bucket_of(ph) });
                 }
                 PT[4].fetch_add(tt.elapsed().as_nanos() as usize, AO::Relaxed);
             }
@@ -1618,8 +1628,8 @@ fn main() {
             // Gather by a counting sort on further person-hash bits, then sort
             // each small bucket exactly by (person, ts). People end up ordered by
             // (bucket, person), the same for events and clicks.
-            bucket_gather(&p2s, q, |p| &p.ev, |e| e.person, &mut ev, &mut st.counts_ev);
-            bucket_gather(&p2s, q, |p| &p.cl, |c| c.person, &mut cl, &mut st.counts_cl);
+            bucket_gather(&p2s, q, |p| &p.ev, |e| e.bk as usize, &mut ev, &mut st.counts_ev);
+            bucket_gather(&p2s, q, |p| &p.cl, |c| c.bk as usize, &mut cl, &mut st.counts_cl);
             for w in st.counts_ev.windows(2) {
                 ev[w[0] as usize..w[1] as usize].sort_unstable_by(|a, b| a.person.cmp(&b.person).then(a.ts.cmp(&b.ts)));
             }
@@ -1635,8 +1645,8 @@ fn main() {
                 while j < ev.len() && ev[j].person == person {
                     j += 1;
                 }
-                let pk = (sub_bucket(person), person);
-                while ci < cl.len() && (sub_bucket(cl[ci].person), cl[ci].person) < pk {
+                let pk = (ev[i].bk, person);
+                while ci < cl.len() && (cl[ci].bk, cl[ci].person) < pk {
                     ci += 1;
                 }
                 let cs = ci;
