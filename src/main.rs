@@ -31,6 +31,7 @@ struct HugeAlloc;
 extern "C" {
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+    fn posix_fadvise(fd: i32, offset: i64, len: i64, advice: i32) -> i32;
 }
 
 const MADV_POPULATE_READ: i32 = 22;
@@ -1225,6 +1226,19 @@ fn main() {
                 s = e;
             }
         }
+    }
+    // Start reading every input file now, in the order workers will need them:
+    // many requests in flight if the data is not in the page cache yet.
+    {
+        use std::os::unix::io::AsRawFd;
+        let fds: Vec<i32> = files.iter().map(|f| f.1.as_raw_fd()).collect();
+        std::thread::spawn(move || {
+            for fd in fds {
+                unsafe {
+                    posix_fadvise(fd, 0, 0, 3); // POSIX_FADV_WILLNEED
+                }
+            }
+        });
     }
     let est_ev = (ev_bytes / 64) as usize;
     let est_cl = (cl_bytes / 40) as usize;
