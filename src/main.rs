@@ -767,7 +767,8 @@ struct P2 {
     ev: Parted<EvP>,
     cl: Parted<ClP>,
     recs: Vec<EvRaw>,
-    table: Vec<u32>,
+    table: Vec<u64>,
+    keep: Vec<u8>,
     surv: Vec<EvRaw>,
 }
 
@@ -992,7 +993,7 @@ fn main() {
     let p2s = run_par(
         w,
         NP + ncl_chunks.len(),
-        || P2 { ev: parted(NQ, est_ev / w), cl: parted(NQ, est_cl * 11 / 10 / w), recs: Vec::new(), table: Vec::new(), surv: Vec::new() },
+        || P2 { ev: parted(NQ, est_ev / w), cl: parted(NQ, est_cl * 11 / 10 / w), recs: Vec::new(), table: Vec::new(), keep: Vec::new(), surv: Vec::new() },
         |st, t| {
             if t < NP {
                 let tt = Instant::now();
@@ -1006,24 +1007,36 @@ fn main() {
                 let tt = Instant::now();
                 let cap = (n * 2).max(16).next_power_of_two();
                 let mask = cap - 1;
+                // Each slot: hash fingerprint (high 32 bits) and record index + 1.
                 let table = &mut st.table;
                 table.clear();
                 table.resize(cap, 0);
+                let keep = &mut st.keep;
+                keep.clear();
+                keep.resize(n, 0);
                 for (i, r) in recs.iter().enumerate() {
-                    let id = i as u32 + 1;
-                    let mut s = h64(r.eid) as usize & mask;
+                    let id = i as u64 + 1;
+                    let h = h64(r.eid);
+                    let fp = h & 0xFFFF_FFFF_0000_0000;
+                    let mut s = h as usize & mask;
                     loop {
                         let cur = table[s];
                         if cur == 0 {
-                            table[s] = id;
+                            table[s] = fp | id;
+                            keep[i] = 1;
                             break;
                         }
-                        let c = &recs[cur as usize - 1];
-                        if c.eid == r.eid {
-                            if ((r.ip >> 32) as u32 as i32) < ((c.ip >> 32) as u32 as i32) {
-                                table[s] = id;
+                        if cur & 0xFFFF_FFFF_0000_0000 == fp {
+                            let ci = (cur & 0xFFFF_FFFF) as usize - 1;
+                            let c = &recs[ci];
+                            if c.eid == r.eid {
+                                if ((r.ip >> 32) as u32 as i32) < ((c.ip >> 32) as u32 as i32) {
+                                    table[s] = fp | id;
+                                    keep[ci] = 0;
+                                    keep[i] = 1;
+                                }
+                                break;
                             }
-                            break;
                         }
                         s = (s + 1) & mask;
                     }
@@ -1032,17 +1045,14 @@ fn main() {
                 let tt = Instant::now();
                 let surv = &mut st.surv;
                 surv.clear();
-                for &id in table.iter() {
-                    if id != 0 {
-                        let r = recs[id as usize - 1];
-                        if r.user != 0 {
-                            surv.push(r);
-                        }
+                for (r, &k) in recs.iter().zip(keep.iter()) {
+                    if k != 0 && r.user != 0 {
+                        surv.push(*r);
                     }
                 }
                 PT[2].fetch_add(tt.elapsed().as_nanos() as usize, AO::Relaxed);
                 let tt = Instant::now();
-                const AHEAD: usize = 8;
+                const AHEAD: usize = 24;
                 for i in 0..surv.len() {
                     if i + AHEAD < surv.len() {
                         pmap.prefetch(surv[i + AHEAD].user);
@@ -1057,7 +1067,7 @@ fn main() {
                 let tt = Instant::now();
                 let (wi, s, e) = ncl_chunks[t - NP];
                 let cl = &p1s[wi].cl[s..e];
-                const AHEAD: usize = 8;
+                const AHEAD: usize = 24;
                 for i in 0..cl.len() {
                     if i + AHEAD < cl.len() {
                         pmap.prefetch(cl[i + AHEAD].user);
