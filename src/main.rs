@@ -58,7 +58,7 @@ fn map_file(f: &File, size: u64) -> Option<&'static [u8]> {
     if p as isize == -1 || p.is_null() {
         return None;
     }
-    register_big(p, size as usize);
+    MAPS.lock().unwrap().push((p as usize, size as usize));
     Some(unsafe { std::slice::from_raw_parts(p, size as usize) })
 }
 
@@ -870,12 +870,14 @@ impl<T: Copy> Parted<T> {
         }
         if self.used >= self.chunk_bytes {
             // u64 storage: blocks start 8-byte aligned (BLOCK_BYTES is a multiple of 8).
-            self.chunks.push(Vec::with_capacity(self.chunk_bytes / 8));
-            register_big(self.chunks.last().unwrap().as_ptr() as *const u8, self.chunk_bytes);
+            // One extra page so blocks can start page-aligned (released block by block).
+            self.chunks.push(Vec::with_capacity((self.chunk_bytes + 4096) / 8));
+            register_big(self.chunks.last().unwrap().as_ptr() as *const u8, self.chunk_bytes + 4096);
             self.used = 0;
             self.populated = 0;
         }
-        let base = self.chunks.last_mut().unwrap().as_mut_ptr() as *mut u8;
+        let raw = self.chunks.last_mut().unwrap().as_mut_ptr() as *mut u8;
+        let base = unsafe { raw.add((4096 - raw as usize % 4096) % 4096) };
         if self.used + BLOCK_BYTES > self.populated {
             // Fault in the next window with one call instead of page by page.
             let upto = (self.populated + (4 << 20)).min(self.chunk_bytes);
@@ -911,6 +913,20 @@ impl<T: Copy> Parted<T> {
         let c = self.cur[p];
         if !c.0.is_null() {
             f(unsafe { std::slice::from_raw_parts(c.0, c.1 as usize) });
+        }
+    }
+    /// Drops partition p's pages (MADV_DONTNEED). The caller must never read
+    /// them again and they must not be in POOL.
+    fn release_partition(&self, p: usize) {
+        let c = self.cur[p];
+        for b in self.done[p].iter().copied().chain((!c.0.is_null()).then_some(c.0)) {
+            let a = (b as usize + 4095) & !4095;
+            let e = (b as usize + BLOCK_BYTES) & !4095;
+            if e > a {
+                unsafe {
+                    madvise(a as *mut u8, e - a, 4); // MADV_DONTNEED
+                }
+            }
         }
     }
     /// Appends partition p's blocks as (address, records).
@@ -1188,6 +1204,26 @@ fn bucket_gather<P, T: Copy>(src: &[P], q: usize, get: impl Fn(&P) -> &Parted<T>
 /// buffers. Released in parallel right before exit (`release_memory`).
 static BIG: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 
+/// Input file mappings: dead once parsing ends, released during phase 2.
+static MAPS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+/// Page-aligned pieces of at most 8 MB covering the given regions (trimmed inward).
+fn pieces_of(list: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    const PIECE: usize = 8 << 20;
+    let mut pieces = Vec::new();
+    for &(p, n) in list {
+        let a = (p + 4095) & !4095;
+        let b = (p + n) & !4095;
+        let mut s = a;
+        while s < b {
+            let e = (s + PIECE).min(b);
+            pieces.push((s, e - s));
+            s = e;
+        }
+    }
+    pieces
+}
+
 fn register_big(p: *const u8, bytes: usize) {
     if bytes >= 1 << 20 {
         BIG.lock().unwrap().push((p as usize, bytes));
@@ -1198,18 +1234,7 @@ fn register_big(p: *const u8, bytes: usize) {
 /// so allocator headers are untouched), split across `w` threads. Only called
 /// right before exit: nothing may touch that memory afterwards.
 fn release_memory(w: usize) {
-    const PIECE: usize = 8 << 20;
-    let mut pieces: Vec<(usize, usize)> = Vec::new();
-    for &(p, n) in BIG.lock().unwrap().iter() {
-        let a = (p + 4095) & !4095;
-        let b = (p + n) & !4095;
-        let mut s = a;
-        while s < b {
-            let e = (s + PIECE).min(b);
-            pieces.push((s, e - s));
-            s = e;
-        }
-    }
+    let pieces = pieces_of(&BIG.lock().unwrap());
     run_par(w, pieces.len(), || (), |_, i| {
         let (a, n) = pieces[i];
         unsafe {
@@ -1469,9 +1494,9 @@ fn main() {
         },
     );
     let pmap = people.into_inner().expect("people built");
-    for p in &p1s {
-        register_big(p.cl.as_ptr() as *const u8, p.cl.capacity() * std::mem::size_of::<ClickRaw>());
-    }
+    let map_pieces = pieces_of(&MAPS.lock().unwrap());
+    // Raw click buffers are dead after phase 2; released during phase 3.
+    let click_regions: Vec<(usize, usize)> = p1s.iter().map(|p| (p.cl.as_ptr() as usize, p.cl.capacity() * std::mem::size_of::<ClickRaw>())).collect();
     log("parsed and linked");
 
     // --- phase 2: dedup events, map to people, partition by person
@@ -1489,7 +1514,7 @@ fn main() {
     };
     let p2s = run_par(
         w,
-        NP + ncl_chunks.len(),
+        NP + ncl_chunks.len() + map_pieces.len(),
         || P2 { ev: parted(NQ, est_ev / w), cl: parted(NQ, est_cl * 11 / 10 / w), blocks: Vec::new(), table: Vec::new() },
         |st, t| {
             if t < NP {
@@ -1599,6 +1624,14 @@ fn main() {
                 PT[3].fetch_add(tt.elapsed().as_nanos() as usize, AO::Relaxed);
             } else {
                 let tt = Instant::now();
+                if t >= NP + ncl_chunks.len() {
+                    // Parsing is over: drop input mappings while others work.
+                    let (a, n) = map_pieces[t - NP - ncl_chunks.len()];
+                    unsafe {
+                        madvise(a as *mut u8, n, 4); // MADV_DONTNEED
+                    }
+                    return;
+                }
                 let (wi, s, e) = ncl_chunks[t - NP];
                 let cl = &p1s[wi].cl[s..e];
                 const FAR: usize = 32;
@@ -1644,9 +1677,13 @@ fn main() {
     let sizes: Vec<usize> = (0..NQ).map(|q| p2s.iter().map(|p| p.ev.len(q) + p.cl.len(q)).sum()).collect();
     order.sort_by_key(|&q| std::cmp::Reverse(sizes[q]));
     let ncat = cat_names.len();
+    let mut late: Vec<(usize, usize)> = std::mem::take(&mut *POOL.lock().unwrap()).into_iter().map(|b| (b, BLOCK_BYTES)).collect();
+    POOL_LEN.store(0, AO::Relaxed);
+    late.extend_from_slice(&click_regions);
+    let late_pieces = pieces_of(&late);
     let p3s = run_par(
         w,
-        NQ,
+        NQ + late_pieces.len(),
         || P3 {
             acc: vec![[0i64; 4]; (ncamp + 1) * ndays],
             counts: vec![0; ncamp],
@@ -1661,6 +1698,15 @@ fn main() {
             counts_cl: Vec::new(),
         },
         |st, t| {
+            if t >= NQ {
+                // Dead memory (leftover spare blocks, raw clicks): drop it while
+                // other workers finish their last partitions.
+                let (a, n) = late_pieces[t - NQ];
+                unsafe {
+                    madvise(a as *mut u8, n, 4); // MADV_DONTNEED
+                }
+                return;
+            }
             let q = order[t];
             let mut ev = std::mem::take(&mut st.ev);
             let mut cl = std::mem::take(&mut st.cl);
@@ -1669,6 +1715,11 @@ fn main() {
             // (bucket, person), the same for events and clicks.
             bucket_gather(&p2s, q, |p| &p.ev, |e| e.bk as usize, &mut ev, &mut st.counts_ev);
             bucket_gather(&p2s, q, |p| &p.cl, |c| c.bk as usize, &mut cl, &mut st.counts_cl);
+            // Partition q is copied out: its blocks are dead.
+            for p in &p2s {
+                p.ev.release_partition(q);
+                p.cl.release_partition(q);
+            }
             for w in st.counts_ev.windows(2) {
                 ev[w[0] as usize..w[1] as usize].sort_unstable_by(|a, b| a.person.cmp(&b.person).then(a.ts.cmp(&b.ts)));
             }
