@@ -1438,7 +1438,8 @@ fn release_memory(w: usize) {
 
 struct P1 {
     ev: Parted<EvRaw>,
-    cl: Vec<ClickRaw>,
+    /// Raw clicks: one partition, block storage with streamed lines.
+    cl: Parted<ClickRaw>,
     buf: Vec<u8>,
     dc: DateCache,
 }
@@ -1597,7 +1598,7 @@ fn main() {
     let p1s = run_par(
         w,
         tasks.len(),
-        || P1 { ev: parted(NP, est_ev * 11 / 10 / w), cl: Vec::with_capacity(est_cl * 11 / 10 / w), buf: Vec::new(), dc: DateCache::new() },
+        || P1 { ev: parted(NP, est_ev * 11 / 10 / w), cl: parted(1, est_cl * 11 / 10 / w), buf: Vec::new(), dc: DateCache::new() },
         |st, t| {
             let (fi, s, e) = tasks[t];
             let (kind, ref file, size, map) = files[fi];
@@ -1667,7 +1668,7 @@ fn main() {
                             Some(c) => c,
                             None => return,
                         };
-                        st.cl.push(ClickRaw { user: pack(f[1]), cid: pack(f[0]), ts, camp });
+                        st.cl.push(0, ClickRaw { user: pack(f[1]), cid: pack(f[0]), ts, camp });
                     });
                 }
                 _ => {
@@ -1690,11 +1691,12 @@ fn main() {
     let mut p1s = p1s;
     for p in p1s.iter_mut() {
         p.ev.finish();
+        p.cl.finish();
     }
     let pmap = people.into_inner().expect("people built");
     let map_pieces = pieces_of(&MAPS.lock().unwrap());
     // Raw click buffers are dead after phase 2; released during phase 3.
-    let click_regions: Vec<(usize, usize)> = p1s.iter().map(|p| (p.cl.as_ptr() as usize, p.cl.capacity() * std::mem::size_of::<ClickRaw>())).collect();
+    let click_regions: Vec<(usize, usize)> = Vec::new();
     log("parsed and linked");
 
     let pk = Pack::new(ws, we, cat_names.len());
@@ -1735,12 +1737,20 @@ fn phases23<E: Rec>(a: Phase23, pk: Pack) -> ! {
         eprintln!("[{:7.3}s user {:6.2} sys {:6.2}] {m}", t0.elapsed().as_secs_f64(), u, sy)
     };
     // --- phase 2: dedup events, map to people, partition by person
+    let cl_blocks: Vec<Vec<(usize, u32)>> = p1s
+        .iter()
+        .map(|p| {
+            let mut v = Vec::new();
+            p.cl.raw_blocks(0, &mut v);
+            v
+        })
+        .collect();
     let ncl_chunks: Vec<(usize, usize, usize)> = {
         let mut v = Vec::new();
-        for (wi, p) in p1s.iter().enumerate() {
+        for (wi, b) in cl_blocks.iter().enumerate() {
             let mut s = 0;
-            while s < p.cl.len() {
-                let e = (s + (1 << 16)).min(p.cl.len());
+            while s < b.len() {
+                let e = (s + 64).min(b.len());
                 v.push((wi, s, e));
                 s = e;
             }
@@ -1868,7 +1878,8 @@ fn phases23<E: Rec>(a: Phase23, pk: Pack) -> ! {
                     return;
                 }
                 let (wi, s, e) = ncl_chunks[t - NP];
-                let cl = &p1s[wi].cl[s..e];
+                for &(bp, bl) in &cl_blocks[wi][s..e] {
+                let cl = unsafe { std::slice::from_raw_parts(bp as *const ClickRaw, bl as usize) };
                 const FAR: usize = 32;
                 const NEAR: usize = 16;
                 // Each user is hashed once: a ring keeps hashes from the far stage.
@@ -1892,6 +1903,13 @@ fn phases23<E: Rec>(a: Phase23, pk: Pack) -> ! {
                     let (person, ph) = pmap.person_h(c.user, h);
                     let q = (ph >> (64 - NQ_BITS)) as usize;
                     st.cl.push(q, ClP { person, cid: c.cid, ts: c.ts, camp: c.camp, bk: bucket_cheap(person) });
+                }
+                }
+                // These click blocks are consumed: they can hold phase-2 output.
+                {
+                    let mut g = POOL.lock().unwrap();
+                    g.extend(cl_blocks[wi][s..e].iter().map(|b| b.0));
+                    POOL_LEN.store(g.len(), AO::Relaxed);
                 }
                 PT[4].fetch_add(tt.elapsed().as_nanos() as usize, AO::Relaxed);
             }
