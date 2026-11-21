@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering as AO};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering as AO};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
@@ -808,6 +808,50 @@ mod scan_tests {
     }
 
     #[test]
+    fn parallel_union_find_matches_sequential() {
+        let mut seed: u64 = 7;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..20 {
+            let nids = 1 + (next() % 50_000) as usize;
+            let key = |i: u64| pack(format!("u{:x}", i * 2654435761 % 1_000_003).as_bytes());
+            let mut pairs = Vec::new();
+            // chains, random edges, self links, repeats, one giant component
+            for _ in 0..(next() % 80_000) {
+                let a = next() % nids as u64;
+                let b = match next() % 4 {
+                    0 => a,
+                    1 => (a + 1) % nids as u64,
+                    2 => next() % 7,
+                    _ => next() % nids as u64,
+                };
+                pairs.push((key(a), key(b)));
+            }
+            let seq = build_people(&[pairs.clone()]);
+            let uf = Uf::new(pairs.clone());
+            std::thread::scope(|sc| {
+                for _ in 0..8 {
+                    sc.spawn(|| while uf.work() {});
+                }
+            });
+            let par = finish_people(uf, 8);
+            for &(a, b) in &pairs {
+                for k in [a, b] {
+                    assert_eq!(par.person(k), seq.person(k), "round {round}");
+                }
+            }
+            for i in 0..1000 {
+                let k = key(i);
+                assert_eq!(par.person(k), seq.person(k), "unlinked round {round}");
+            }
+        }
+    }
+
+    #[test]
     fn scan_edge_cases() {
         for text in [
             &b""[..], b"\n", b"a,b", b"a,b\n", b"\"\",\"\"\n", b"\",\"\n", b"\"\"\",x\n", b"a\"b,c\n",
@@ -1339,6 +1383,225 @@ fn list_csv(dir: &Path) -> Vec<(PathBuf, u64)> {
     v
 }
 
+/// A zeroed Vec of atomics, from zeroed (lazily faulted) memory.
+fn atomic_zeros64(n: usize) -> Vec<AtomicU64> {
+    let v = std::mem::ManuallyDrop::new(vec![0u64; n]);
+    // SAFETY: AtomicU64 has the same size, alignment and bit validity as u64.
+    unsafe { Vec::from_raw_parts(v.as_ptr() as *mut AtomicU64, v.len(), v.capacity()) }
+}
+
+fn atomic_zeros32(n: usize) -> Vec<AtomicU32> {
+    let v = std::mem::ManuallyDrop::new(vec![0u32; n]);
+    // SAFETY: AtomicU32 has the same size, alignment and bit validity as u32.
+    unsafe { Vec::from_raw_parts(v.as_ptr() as *mut AtomicU32, v.len(), v.capacity()) }
+}
+
+// ---------------------------------------------------------------- parallel linking
+
+/// Concurrent union-find over every linked ID, shared by the phase-1 workers.
+/// IDs get dense indexes through a lock-free open-addressing table; a union
+/// links the larger root index under the smaller one (so no cycles can form);
+/// finds shortcut paths with compare-and-swap.
+struct Uf {
+    pairs: Vec<(u64, u64)>,
+    next: AtomicUsize,
+    keys: Vec<AtomicU64>,
+    /// Index + 1 of the key in the same slot; 0 while not yet published.
+    vals: Vec<AtomicU32>,
+    mask: usize,
+    count: AtomicU32,
+    parent: Vec<AtomicU32>,
+    ids: Vec<AtomicU64>,
+    /// Some key is an interned "other" string: naming must compare strings.
+    other: AtomicBool,
+}
+
+const UF_CHUNK: usize = 16 << 10;
+
+impl Uf {
+    fn new(pairs: Vec<(u64, u64)>) -> Self {
+        let max_ids = (pairs.len() * 2).max(1);
+        let cap = (max_ids * 2).max(16).next_power_of_two();
+        let zeros64 = atomic_zeros64;
+        let zeros32 = atomic_zeros32;
+        Uf {
+            pairs,
+            next: AtomicUsize::new(0),
+            keys: zeros64(cap),
+            vals: zeros32(cap),
+            mask: cap - 1,
+            count: AtomicU32::new(0),
+            parent: zeros32(max_ids),
+            ids: zeros64(max_ids),
+            other: AtomicBool::new(false),
+        }
+    }
+    fn chunks(&self) -> usize {
+        self.pairs.len().div_ceil(UF_CHUNK)
+    }
+    #[inline]
+    fn intern(&self, k: u64) -> u32 {
+        let mut i = h64(k) as usize & self.mask;
+        loop {
+            let cur = self.keys[i].load(AO::Acquire);
+            if cur == 0 {
+                match self.keys[i].compare_exchange(0, k, AO::AcqRel, AO::Acquire) {
+                    Ok(_) => {
+                        let idx = self.count.fetch_add(1, AO::Relaxed);
+                        self.ids[idx as usize].store(k, AO::Relaxed);
+                        self.parent[idx as usize].store(idx, AO::Relaxed);
+                        if k & OTHER != 0 {
+                            self.other.store(true, AO::Relaxed);
+                        }
+                        self.vals[i].store(idx + 1, AO::Release);
+                        return idx;
+                    }
+                    Err(actual) if actual != k => {
+                        i = (i + 1) & self.mask;
+                        continue;
+                    }
+                    Err(_) => {}
+                }
+            } else if cur != k {
+                i = (i + 1) & self.mask;
+                continue;
+            }
+            // Our key, inserted by someone: wait for its index.
+            loop {
+                let v = self.vals[i].load(AO::Acquire);
+                if v != 0 {
+                    return v - 1;
+                }
+                std::hint::spin_loop();
+            }
+        }
+    }
+    #[inline]
+    fn find(&self, mut x: u32) -> u32 {
+        loop {
+            let p = self.parent[x as usize].load(AO::Acquire);
+            if p == x {
+                return x;
+            }
+            let g = self.parent[p as usize].load(AO::Acquire);
+            if g != p {
+                let _ = self.parent[x as usize].compare_exchange(p, g, AO::AcqRel, AO::Relaxed);
+            }
+            x = p;
+        }
+    }
+    #[inline]
+    fn union(&self, a: u32, b: u32) {
+        loop {
+            let ra = self.find(a);
+            let rb = self.find(b);
+            if ra == rb {
+                return;
+            }
+            let (hi, lo) = if ra > rb { (ra, rb) } else { (rb, ra) };
+            if self.parent[hi as usize].compare_exchange(hi, lo, AO::AcqRel, AO::Relaxed).is_ok() {
+                return;
+            }
+        }
+    }
+    /// Processes one claimed chunk of pairs; false when none is left.
+    fn work(&self) -> bool {
+        let c = self.next.fetch_add(1, AO::Relaxed);
+        if c >= self.chunks() {
+            return false;
+        }
+        let end = ((c + 1) * UF_CHUNK).min(self.pairs.len());
+        for &(a, b) in &self.pairs[c * UF_CHUNK..end] {
+            let ia = self.intern(a);
+            let ib = self.intern(b);
+            self.union(ia, ib);
+        }
+        true
+    }
+}
+
+/// After every union is done: names each person by its smallest ID and builds
+/// the ID -> name map (only IDs whose name differs) with its Bloom filter.
+fn finish_people(uf: Uf, w: usize) -> People {
+    while uf.work() {}
+    let n = uf.count.load(AO::Acquire) as usize;
+    // names[root] = !smallest key, so a max over !key is a min over keys
+    // (zero-initialized = no key yet). Byte order equals integer order for
+    // compact keys; "other" keys need string comparison, done sequentially.
+    let names: Vec<AtomicU64> = atomic_zeros64(n);
+    let roots: Vec<AtomicU32> = atomic_zeros32(n);
+    const STEP: usize = 64 << 10;
+    let tasks = n.div_ceil(STEP);
+    run_par(w, tasks, || (), |_, t| {
+        for i in t * STEP..((t + 1) * STEP).min(n) {
+            let r = uf.find(i as u32);
+            roots[i].store(r, AO::Relaxed);
+            names[r as usize].fetch_max(!uf.ids[i].load(AO::Relaxed), AO::Relaxed);
+        }
+    });
+    if uf.other.load(AO::Relaxed) {
+        let mut best: Vec<u64> = vec![0; n];
+        let mut set = vec![false; n];
+        for i in 0..n {
+            let r = roots[i].load(AO::Relaxed) as usize;
+            let k = uf.ids[i].load(AO::Relaxed);
+            if !set[r] || key_cmp(k, best[r]) == Ordering::Less {
+                best[r] = k;
+                set[r] = true;
+            }
+        }
+        for r in 0..n {
+            if set[r] {
+                names[r].store(!best[r], AO::Relaxed);
+            }
+        }
+    }
+    // Size the map and Bloom filter for the renamed IDs only (as before):
+    // a bigger table makes every phase-2 lookup miss cache more often.
+    let renamed = AtomicUsize::new(0);
+    run_par(w, tasks, || (), |_, t| {
+        let mut c = 0usize;
+        for i in t * STEP..((t + 1) * STEP).min(n) {
+            let k = uf.ids[i].load(AO::Relaxed);
+            c += (k != !names[roots[i].load(AO::Relaxed) as usize].load(AO::Relaxed)) as usize;
+        }
+        renamed.fetch_add(c, AO::Relaxed);
+    });
+    let renamed = renamed.into_inner();
+    let mut map = Map::<u64>::new(renamed + 16);
+    let words = (renamed / 4).max(1024).next_power_of_two();
+    let mut bloom = vec![0u64; words];
+    let shift = 64 - words.trailing_zeros();
+    let mask = map.mask;
+    let slots = map.s.as_mut_ptr() as usize;
+    let bloom_ptr = bloom.as_mut_ptr() as usize;
+    run_par(w, tasks, || (), |_, t| {
+        for i in t * STEP..((t + 1) * STEP).min(n) {
+            let k = uf.ids[i].load(AO::Relaxed);
+            let name = !names[roots[i].load(AO::Relaxed) as usize].load(AO::Relaxed);
+            if k == name {
+                continue;
+            }
+            let h = h64(k);
+            let mut s = h as usize & mask;
+            loop {
+                // SAFETY: slots are (u64, u64) pairs inside `map.s`; keys are
+                // claimed with a CAS, and every ID is inserted exactly once.
+                let kp = unsafe { (slots as *mut (u64, u64)).add(s) as *mut u64 };
+                let ka = unsafe { AtomicU64::from_ptr(kp) };
+                if ka.compare_exchange(0, k, AO::AcqRel, AO::Relaxed).is_ok() {
+                    unsafe { AtomicU64::from_ptr(kp.add(1)) }.store(name, AO::Relaxed);
+                    break;
+                }
+                s = (s + 1) & mask;
+            }
+            let wa = unsafe { AtomicU64::from_ptr((bloom_ptr as *mut u64).add((h >> shift) as usize)) };
+            wa.fetch_or(People::bits(h), AO::Relaxed);
+        }
+    });
+    People { map, bloom, shift }
+}
+
 // ---------------------------------------------------------------- linking
 
 /// ID -> person name, for the IDs whose name is a different ID. Every other
@@ -1728,15 +1991,17 @@ fn main() {
     // --- phase 1: parse (and link)
     let links_store: Mutex<Vec<Vec<(u64, u64)>>> = Mutex::new(Vec::new());
     let links_left = AtomicUsize::new(link_tasks);
-    let people: OnceLock<People> = OnceLock::new();
-    if link_tasks == 0 {
-        let _ = people.set(build_people(&[]));
-    }
+    // Once the last link chunk is parsed, all workers help with the union-find
+    // (before each parse task) instead of one worker doing it alone.
+    let uf_cell: OnceLock<Uf> = OnceLock::new();
     let p1s = run_par(
         w,
         tasks.len(),
         || P1 { ev: parted(NP, est_ev * 11 / 10 / w), cl: parted(1, est_cl * 11 / 10 / w), buf: Vec::new(), dc: DateCache::new() },
         |st, t| {
+            if let Some(uf) = uf_cell.get() {
+                while uf.work() {}
+            }
             let (fi, s, e) = tasks[t];
             let (kind, ref file, size, map) = files[fi];
             let mut owned = std::mem::take(&mut st.buf);
@@ -1783,7 +2048,8 @@ fn main() {
                     links_store.lock().unwrap().push(local);
                     if links_left.fetch_sub(1, AO::AcqRel) == 1 {
                         let all = std::mem::take(&mut *links_store.lock().unwrap());
-                        let _ = people.set(build_people(&all));
+                        let flat: Vec<(u64, u64)> = all.into_iter().flatten().collect();
+                        let _ = uf_cell.set(Uf::new(flat));
                     }
                 }
             }
@@ -1795,7 +2061,10 @@ fn main() {
         p.ev.finish();
         p.cl.finish();
     }
-    let pmap = people.into_inner().expect("people built");
+    let pmap = match uf_cell.into_inner() {
+        Some(uf) => finish_people(uf, w),
+        None => build_people(&[]),
+    };
     let map_pieces = pieces_of(&MAPS.lock().unwrap());
     // Raw click buffers are dead after phase 2; released during phase 3.
     let click_regions: Vec<(usize, usize)> = Vec::new();
