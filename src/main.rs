@@ -1909,19 +1909,57 @@ fn main() {
     let manifest = std::fs::read_to_string(data.join("manifest.json")).expect("manifest");
     let ws = manifest_ts(&manifest, "window_start");
     let we = manifest_ts(&manifest, "window_end");
-    let prod_rows = csv_rows::<2>(&data.join("products.csv"));
-    let mut cat_names: Vec<Vec<u8>> = prod_rows.iter().map(|r| r[1].clone()).collect();
+    // products.csv without per-row allocations: categories get a temporary id
+    // in first-seen order (linear search: there are few), then are ranked by
+    // name, which is the tie-break order for top_category.
+    let pdata = std::fs::read(data.join("products.csv")).unwrap_or_default();
+    let mut tmp_names: Vec<&[u8]> = Vec::new();
+    let mut tmp_index: HashMap<&[u8], u16> = HashMap::new();
+    let mut prod_rows: Vec<(u64, u16)> = Vec::new();
+    {
+        let mut pos = match find_nl(&pdata, 0) {
+            Some(i) => i + 1,
+            None => pdata.len(),
+        };
+        let mut f: [&[u8]; 2] = [&[]; 2];
+        while pos < pdata.len() {
+            let (ok, next) = split::<2>(&pdata, pos, pdata.len(), &mut f);
+            pos = next;
+            if !ok {
+                continue;
+            }
+            let c = f[1];
+            let t = if tmp_names.len() <= 64 {
+                match tmp_names.iter().position(|&x| x == c) {
+                    Some(t) => t as u16,
+                    None => {
+                        tmp_names.push(c);
+                        (tmp_names.len() - 1) as u16
+                    }
+                }
+            } else {
+                if tmp_index.is_empty() {
+                    tmp_index = tmp_names.iter().enumerate().map(|(i, &x)| (x, i as u16)).collect();
+                }
+                *tmp_index.entry(c).or_insert_with(|| {
+                    tmp_names.push(c);
+                    (tmp_names.len() - 1) as u16
+                })
+            };
+            prod_rows.push((pack(f[0]), t));
+        }
+    }
+    let mut cat_names: Vec<Vec<u8>> = tmp_names.iter().map(|x| x.to_vec()).collect();
     cat_names.push(b"unknown".to_vec());
     cat_names.sort();
     cat_names.dedup();
-    let cat_index: HashMap<Vec<u8>, u16> = cat_names.iter().enumerate().map(|(i, c)| (c.clone(), i as u16)).collect();
-    let unknown_cat = cat_index[&b"unknown"[..]];
+    let rank: Vec<u16> = tmp_names.iter().map(|x| cat_names.binary_search_by(|c| c.as_slice().cmp(x)).unwrap() as u16).collect();
+    let unknown_cat = cat_names.binary_search_by(|c| c.as_slice().cmp(&b"unknown"[..])).unwrap() as u16;
     let mut products = Map::<u16>::new(prod_rows.len());
-    for r in &prod_rows {
-        let k = pack(&r[0]);
+    for &(k, t) in &prod_rows {
         if k != 0 {
             let (i, _) = products.slot(k);
-            products.s[i].1 = cat_index[&r[1]];
+            products.s[i].1 = rank[t as usize];
         }
     }
     let camp_rows = csv_rows::<2>(&data.join("campaigns.csv"));
