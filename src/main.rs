@@ -19,7 +19,7 @@ const NP_BITS: u32 = 8; // event_id partitions
 const NP: usize = 1 << NP_BITS;
 const NQ_BITS: u32 = 8; // person partitions
 const NQ: usize = 1 << NQ_BITS;
-const CHUNK: u64 = 8 << 20;
+const CHUNK: u64 = 4 << 20;
 
 
 // ---------------------------------------------------------------- allocator
@@ -1314,11 +1314,18 @@ fn parted<T: Copy>(parts: usize, expect: usize) -> Parted<T> {
 // ---------------------------------------------------------------- parallel helper
 
 fn run_par<S: Send, I: Fn() -> S + Sync, F: Fn(&mut S, usize) + Sync>(w: usize, ntasks: usize, init: I, f: F) -> Vec<S> {
+    run_par_fin(w, ntasks, init, f, |_, _| {})
+}
+
+/// `run_par`, plus `fin(state, worker)` on each worker right after it runs out
+/// of tasks (overlapping with workers still finishing their last task).
+fn run_par_fin<S: Send, I: Fn() -> S + Sync, F: Fn(&mut S, usize) + Sync, G: Fn(&mut S, usize) + Sync>(w: usize, ntasks: usize, init: I, f: F, fin: G) -> Vec<S> {
     let next = AtomicUsize::new(0);
     std::thread::scope(|sc| {
         let hs: Vec<_> = (0..w)
-            .map(|_| {
-                sc.spawn(|| {
+            .map(|wi| {
+                let (init, f, fin, next) = (&init, &f, &fin, &next);
+                sc.spawn(move || {
                     let mut s = init();
                     loop {
                         let t = next.fetch_add(1, AO::Relaxed);
@@ -1327,6 +1334,7 @@ fn run_par<S: Send, I: Fn() -> S + Sync, F: Fn(&mut S, usize) + Sync>(w: usize, 
                         }
                         f(&mut s, t);
                     }
+                    fin(&mut s, wi);
                     // Order this thread's non-temporal stores before the join.
                     unsafe { core::arch::x86_64::_mm_sfence() };
                     s
@@ -1532,12 +1540,16 @@ fn finish_people(uf: Uf, w: usize) -> People {
     let roots: Vec<AtomicU32> = atomic_zeros32(n);
     const STEP: usize = 64 << 10;
     let tasks = n.div_ceil(STEP);
+    let persons = AtomicUsize::new(0);
     run_par(w, tasks, || (), |_, t| {
+        let mut c = 0usize;
         for i in t * STEP..((t + 1) * STEP).min(n) {
             let r = uf.find(i as u32);
             roots[i].store(r, AO::Relaxed);
+            c += (r == i as u32) as usize;
             names[r as usize].fetch_max(!uf.ids[i].load(AO::Relaxed), AO::Relaxed);
         }
+        persons.fetch_add(c, AO::Relaxed);
     });
     if uf.other.load(AO::Relaxed) {
         let mut best: Vec<u64> = vec![0; n];
@@ -1558,16 +1570,9 @@ fn finish_people(uf: Uf, w: usize) -> People {
     }
     // Size the map and Bloom filter for the renamed IDs only (as before):
     // a bigger table makes every phase-2 lookup miss cache more often.
-    let renamed = AtomicUsize::new(0);
-    run_par(w, tasks, || (), |_, t| {
-        let mut c = 0usize;
-        for i in t * STEP..((t + 1) * STEP).min(n) {
-            let k = uf.ids[i].load(AO::Relaxed);
-            c += (k != !names[roots[i].load(AO::Relaxed) as usize].load(AO::Relaxed)) as usize;
-        }
-        renamed.fetch_add(c, AO::Relaxed);
-    });
-    let renamed = renamed.into_inner();
+    // Each person keeps exactly one of its IDs as its name, so the renamed
+    // IDs number ids - persons (persons = roots).
+    let renamed = n - persons.into_inner();
     let mut map = Map::<u64>::new(renamed + 16);
     let words = (renamed / 4).max(1024).next_power_of_two();
     let mut bloom = vec![0u64; words];
@@ -2310,7 +2315,7 @@ fn phases23<E: Rec>(a: Phase23, pk: Pack) -> ! {
     POOL_LEN.store(0, AO::Relaxed);
     late.extend_from_slice(&click_regions);
     let late_pieces = pieces_of(&late);
-    let p3s = run_par(
+    let p3s = run_par_fin(
         w,
         NQ + late_pieces.len(),
         || P3::<E> {
@@ -2391,32 +2396,26 @@ fn phases23<E: Rec>(a: Phase23, pk: Pack) -> ! {
             st.ev = ev;
             st.cl = cl;
         },
-    );
-    // user_daily: one file per worker, written in parallel.
-    let mut p3s = p3s;
-    let outs: Vec<UserRows> = p3s.iter_mut().map(|p| std::mem::take(&mut p.out)).collect();
-    let total_rows: usize = outs.iter().map(|r| r.day.len()).sum();
-    std::thread::scope(|sc| {
-        for (i, rows) in outs.into_iter().enumerate() {
+        |st, wi| {
+            // This worker is out of tasks: write its user_daily file now.
+            let rows = std::mem::take(&mut st.out);
+            st.rows = rows.day.len();
             if rows.day.is_empty() {
-                continue;
+                return;
             }
-            let ud_dir = &ud_dir;
-            let cat_names = &cat_names;
-            sc.spawn(move || {
-                let n = rows.day.len();
-                let cols = [
-                    parquet::Column::PlainStr("user_id", rows.name, n),
-                    parquet::Column::I32("day", rows.day, true),
-                    parquet::Column::I32("sessions", rows.sessions, false),
-                    parquet::Column::I32("events", rows.events, false),
-                    parquet::Column::I64("revenue_cents", rows.revenue),
-                    parquet::Column::DictStr("top_category", rows.top, cat_names),
-                ];
-                parquet::write_file(&ud_dir.join(format!("part-{i:04}.parquet")), &cols).expect("write user_daily");
-            });
-        }
-    });
+            let n = rows.day.len();
+            let cols = [
+                parquet::Column::PlainStr("user_id", rows.name, n),
+                parquet::Column::I32("day", rows.day, true),
+                parquet::Column::I32("sessions", rows.sessions, false),
+                parquet::Column::I32("events", rows.events, false),
+                parquet::Column::I64("revenue_cents", rows.revenue),
+                parquet::Column::DictStr("top_category", rows.top, &cat_names),
+            ];
+            parquet::write_file(&ud_dir.join(format!("part-{wi:04}.parquet")), &cols).expect("write user_daily");
+        },
+    );
+    let total_rows: usize = p3s.iter().map(|p| p.rows).sum();
     if total_rows == 0 {
         let cols = [
             parquet::Column::Str("user_id", vec![]),

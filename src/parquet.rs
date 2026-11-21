@@ -121,17 +121,26 @@ fn bitpack(out: &mut Vec<u8>, vals: impl Iterator<Item = u32>, n: usize, width: 
     let mut t = T::new();
     t.varint(((groups as u64) << 1) | 1);
     out.extend_from_slice(&t.b);
+    // Values LSB-first, `width` bits each, accumulated in a u64 and flushed a
+    // byte at a time; the last group is zero-padded to whole bytes.
+    out.reserve(groups * width as usize);
     let start = out.len();
-    out.resize(start + groups * width as usize, 0);
-    let mut bit = 0usize;
+    let mut acc: u64 = 0;
+    let mut nbits = 0u32;
+    let mask = if width >= 32 { u32::MAX } else { (1u32 << width) - 1 };
     for v in vals {
-        for k in 0..width {
-            if (v >> k) & 1 == 1 {
-                out[start + (bit >> 3)] |= 1 << (bit & 7);
-            }
-            bit += 1;
+        acc |= ((v & mask) as u64) << nbits;
+        nbits += width;
+        while nbits >= 8 {
+            out.push(acc as u8);
+            acc >>= 8;
+            nbits -= 8;
         }
     }
+    if nbits > 0 {
+        out.push(acc as u8);
+    }
+    out.resize(start + groups * width as usize, 0);
 }
 
 fn page_header(kind: i32, size: usize, num_values: usize, data_encoding: i32) -> Vec<u8> {
