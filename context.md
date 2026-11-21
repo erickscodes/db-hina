@@ -12,13 +12,15 @@ Read this first if you are picking up the work without the original chat.
 ## Scores so far
 | Commit | What | Scorer time (20M practice) |
 |---|---|---|
-| `2fb8e19` | AVX2 CSV scanner | **1.66 s** |
-| `b67b114` | exact 8-byte IDs, dedup prefetch, huge pages off | **1.64 s** |
-| `a9b2724` | mmap input, batched page population, recycled blocks, date cache, Bloom-filtered person map | ready, not yet scored (expected ~1.15 s; local 20M ~1.7 s) |
-| later commits | see git log; each one verified before push | |
+| `2fb8e19` | AVX2 CSV scanner | 1.66 s |
+| `b67b114` | exact 8-byte IDs, dedup prefetch, huge pages off | 1.64 s |
+| `50898c8` | zero-copy dedup (+ mmap, recycled blocks, date cache, Bloom person map, exact ingest) | 1.43 s |
+| `c6c0f90` | + readahead, survivors straight from blocks, cached bucket, quote-once scanner | 1.40 s |
+| `aa5d095` | + parallel memory release before exit, 16-byte packed event records | **1.35 s (best; the final uses it unless another is chosen)** |
+| `c3f5c59` | + phase 3 bucket-by-bucket, 8 output files | 1.38 s (same as aa5d095 within noise) |
 | Baseline (PySpark starter) | | 171.91 s |
-
-Calibration used for estimates: scorer ≈ 0.35 s container start + ~0.48 × local 20M wall time.
+Leaderboard at the time: 0.93 / 1.01 / 1.05 / 1.14 / 1.17 s. Practice scores vary up to ~20% by machine.
+Local 20M wall (median, quiet machine) is ~1.6-1.7 s for aa5d095/c3f5c59; the scorer gives only about half of any local gain.
 
 ## Design (src/main.rs, src/parquet.rs): one dependency-free Rust binary
 - Docker: `rust:1.85-slim-bookworm` build stage, `-C target-cpu=x86-64-v3 -C target-feature=+crt-static`, final image `FROM scratch` (~2.3 MB).
@@ -41,6 +43,9 @@ Dedup before validation (earliest copy wins even if invalid or a different user)
 Helper scripts: `C:\Users\zevys\Downloads\databricks\wsltools\` (outside the repo). WSL datasets: `~/dev` (1M), `~/d20` (20M), `~/d60` (60M). Generator: `~/gen/target/release/generate`. perf: `~/perfroot` (`wsltools/prof3.sh`, `prof4.sh`). CPU A/B of two builds: `wsltools/old.sh <commit>` then `wsltools/cpu.sh`.
 
 ## Measured results (local, keep / drop)
+- Phase-1 profile (perf annotate): ~80% of phase-1 time is the two AVX2 loads of input bytes in `masks64` waiting on memory; parsing logic is nearly free. Software prefetch and streaming via a 256 KB `pread` buffer both made no difference, so phase 1 is bound by memory bandwidth/latency, not instructions.
+- Exit teardown was 280-480 ms (single-threaded munmap of ~2 GB at exit): fixed by releasing registered regions with MADV_DONTNEED in parallel / overlapped (`aa5d095`). Never MADV_DONTNEED from /proc/self/maps: it hits glibc arenas (segfault).
+- Dropped after measurement: fusing phase-2 dedup and emit into one pass with tombstones (3% slower: the second pass reads a ~2.5 MB partition from cache); phase-2 (partition, bucket) histograms to skip the phase-3 counting pass (14% slower: random counter increments miss cache); NQ 64/128 (no gain); 1.5x dedup table (no gain); `pread` instead of mmap (slower); MADV_POPULATE off (neutral).
 - Kept: AVX2 scanner; exact u64 IDs (-22% CPU); dedup-table prefetch; mmap + batched population (kernel time 5.5 -> 3.5 CPU-s); block recycling (20M wall ~2.5 -> ~1.7 s); date cache, flat user_id (-2-3%); Bloom-filtered person map (-6%); bucketed phase-3 sort (-3-4%); hash-once lookup pipeline + exact 40-bit ingest + 8-byte-aligned blocks + lock-free empty-pool check (~-5%).
 - Dropped: huge pages (60M: 45 s vs 15 s); sorting lookups by table slot (slower); split lookup/scatter loops (no gain); block sizes 128/256/1024 (no gain); PGO (no measurable gain); scanning winners straight from the dedup table (random reads, slower).
 - Local timing is noisy (±10%); compare by total CPU over 5 alternating runs.
