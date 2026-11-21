@@ -279,13 +279,6 @@ impl<V: Copy + Default> Map<V> {
             core::arch::x86_64::_mm_prefetch(self.s.as_ptr().add(i) as *const i8, core::arch::x86_64::_MM_HINT_T0);
         }
     }
-    #[inline(always)]
-    fn prefetch(&self, k: u64) {
-        let i = h64(k) as usize & self.mask;
-        unsafe {
-            core::arch::x86_64::_mm_prefetch(self.s.as_ptr().add(i) as *const i8, core::arch::x86_64::_MM_HINT_T0);
-        }
-    }
     /// Index of k's slot, inserting it with `V::default()` if absent; true if new.
     #[inline]
     fn slot(&mut self, k: u64) -> (usize, bool) {
@@ -693,8 +686,8 @@ fn scan<'a, const N: usize>(buf: &'a [u8], pos: usize, end: usize, mut on: impl 
 
 /// An event row before dedup. Valid rows have `user != 0`; purchases have a
 /// non-zero price. `tsc` is `ts - ws` in the low 48 bits and the category
-/// above; `ip` is the ingest time (seconds from ws, saturated to i32) in the
-/// high 32 bits and the price in the low 32.
+/// above; `ip` is the ingest time in the high 40 bits (seconds since
+/// 0000-01-01, exact for every valid F1 timestamp) and the price in the low 24.
 #[derive(Clone, Copy)]
 struct EvRaw {
     eid: u64,
@@ -743,11 +736,13 @@ const BLOCK_BYTES: usize = 32 << 10;
 /// Blocks whose records were consumed, ready to be written again: reusing
 /// memory that is already faulted in costs no page faults.
 static POOL: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+/// Blocks in POOL, read without the lock to skip it when empty.
+static POOL_LEN: AtomicUsize = AtomicUsize::new(0);
 
 /// Records appended to many partitions, in fixed-size blocks carved from a few
 /// large chunks or taken from `POOL`, so no per-partition vector grows.
 struct Parted<T: Copy> {
-    chunks: Vec<Vec<u8>>,
+    chunks: Vec<Vec<u64>>,
     chunk_bytes: usize,
     used: usize,
     populated: usize,
@@ -778,21 +773,23 @@ impl<T: Copy> Parted<T> {
     }
     #[cold]
     fn new_block(&mut self) -> *mut T {
-        if self.spare.is_empty() {
+        if self.spare.is_empty() && POOL_LEN.load(AO::Relaxed) > 0 {
             let mut g = POOL.lock().unwrap();
             let take = g.len().min(64);
             let at = g.len() - take;
             self.spare.extend(g.drain(at..));
+            POOL_LEN.store(g.len(), AO::Relaxed);
         }
         if let Some(b) = self.spare.pop() {
             return b as *mut T;
         }
         if self.used >= self.chunk_bytes {
-            self.chunks.push(Vec::with_capacity(self.chunk_bytes));
+            // u64 storage: blocks start 8-byte aligned (BLOCK_BYTES is a multiple of 8).
+            self.chunks.push(Vec::with_capacity(self.chunk_bytes / 8));
             self.used = 0;
             self.populated = 0;
         }
-        let base = self.chunks.last_mut().unwrap().as_mut_ptr();
+        let base = self.chunks.last_mut().unwrap().as_mut_ptr() as *mut u8;
         if self.used + BLOCK_BYTES > self.populated {
             // Fault in the next window with one call instead of page by page.
             let upto = (self.populated + (4 << 20)).min(self.chunk_bytes);
@@ -838,6 +835,7 @@ impl<T: Copy> Parted<T> {
         if !c.0.is_null() {
             g.push(c.0 as usize);
         }
+        POOL_LEN.store(g.len(), AO::Relaxed);
     }
 }
 
@@ -936,23 +934,31 @@ impl People {
         let b = Self::bits(h);
         unsafe { *self.bloom.get_unchecked((h >> self.shift) as usize) & b == b }
     }
-    /// Stage 1, far ahead: bring the Bloom word into cache.
+    /// (person, h64(person)) for an ID whose hash `h` is known.
     #[inline(always)]
-    fn prefetch_bloom(&self, k: u64) {
-        let h = h64(k);
+    fn person_h(&self, k: u64, h: u64) -> (u64, u64) {
+        if !self.maybe(h) {
+            return (k, h);
+        }
+        match self.map.get_h(k, h) {
+            Some(p) => (p, h64(p)),
+            None => (k, h),
+        }
+    }
+    #[inline(always)]
+    fn prefetch_bloom_h(&self, h: u64) {
         unsafe {
             core::arch::x86_64::_mm_prefetch(self.bloom.as_ptr().add((h >> self.shift) as usize) as *const i8, core::arch::x86_64::_MM_HINT_T0);
         }
     }
-    /// Stage 2, nearer: the Bloom word is cached; fetch the table slot if needed.
     #[inline(always)]
-    fn prefetch(&self, k: u64) {
-        let h = h64(k);
+    fn prefetch_h(&self, h: u64) {
         if self.maybe(h) {
             self.map.prefetch_h(h);
         }
     }
     #[inline(always)]
+    #[allow(dead_code)]
     fn person(&self, k: u64) -> u64 {
         let h = h64(k);
         if !self.maybe(h) {
@@ -1121,6 +1127,9 @@ struct P3 {
 }
 
 static PT: [AtomicUsize; 5] = [AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0)];
+/// Seconds from 0000-01-01T00:00:00Z to the epoch, rounded up: F1 years run
+/// 0000-9999, so ingest seconds + this fit in 40 bits.
+const INGEST_BASE: i64 = 62_200_000_000;
 const TS_MASK: u64 = (1 << 48) - 1;
 
 fn main() {
@@ -1221,7 +1230,6 @@ fn main() {
     if link_tasks == 0 {
         let _ = people.set(build_people(&[]));
     }
-    let ws_s = ws.div_euclid(1000);
     let p1s = run_par(
         w,
         tasks.len(),
@@ -1276,9 +1284,9 @@ fn main() {
                             }
                         }
                         let eid = pack(f[0]);
-                        let ing = (ingest.div_euclid(1000) - ws_s).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+                        let ing = (ingest.div_euclid(1000) + INGEST_BASE).clamp(0, (1i64 << 40) - 1) as u64;
                         let p = (h64(eid) >> (64 - NP_BITS)) as usize;
-                        st.ev.push(p, EvRaw { eid, user, tsc: ts as u64 | (cat as u64) << 48, ip: ((ing as u32 as u64) << 32) | price as u64 });
+                        st.ev.push(p, EvRaw { eid, user, tsc: ts as u64 | (cat as u64) << 48, ip: (ing << 24) | price as u64 });
                     });
                 }
                 1 => {
@@ -1381,7 +1389,7 @@ fn main() {
                             let ci = (cur & 0xFFFF_FFFF) as usize - 1;
                             let c = &recs[ci];
                             if c.eid == r.eid {
-                                if ((r.ip >> 32) as u32 as i32) < ((c.ip >> 32) as u32 as i32) {
+                                if (r.ip >> 24) < (c.ip >> 24) {
                                     table[s] = fp | id;
                                     keep[ci] = 0;
                                     keep[i] = 1;
@@ -1405,17 +1413,27 @@ fn main() {
                 let tt = Instant::now();
                 const FAR: usize = 32;
                 const NEAR: usize = 16;
-                for i in 0..surv.len() {
-                    if i + FAR < surv.len() {
-                        pmap.prefetch_bloom(surv[i + FAR].user);
+                // Each user is hashed once: a ring keeps hashes from the far stage.
+                let n = surv.len();
+                let mut ring = [0u64; FAR];
+                for i in 0..FAR.min(n) {
+                    ring[i] = h64(surv[i].user);
+                    pmap.prefetch_bloom_h(ring[i]);
+                }
+                for i in 0..n {
+                    let h = ring[i % FAR];
+                    if i + FAR < n {
+                        let hf = h64(surv[i + FAR].user);
+                        ring[i % FAR] = hf;
+                        pmap.prefetch_bloom_h(hf);
                     }
-                    if i + NEAR < surv.len() {
-                        pmap.prefetch(surv[i + NEAR].user);
+                    if i + NEAR < n {
+                        pmap.prefetch_h(ring[(i + NEAR) % FAR]);
                     }
                     let r = surv[i];
-                    let person = pmap.person(r.user);
-                    let q = (h64(person) >> (64 - NQ_BITS)) as usize;
-                    st.ev.push(q, EvP { person, ts: (r.tsc & TS_MASK) as i64 + ws, price: r.ip as u32, cat: (r.tsc >> 48) as u16 });
+                    let (person, ph) = pmap.person_h(r.user, h);
+                    let q = (ph >> (64 - NQ_BITS)) as usize;
+                    st.ev.push(q, EvP { person, ts: (r.tsc & TS_MASK) as i64 + ws, price: (r.ip & 0xFF_FFFF) as u32, cat: (r.tsc >> 48) as u16 });
                 }
                 PT[3].fetch_add(tt.elapsed().as_nanos() as usize, AO::Relaxed);
             } else {
@@ -1424,16 +1442,26 @@ fn main() {
                 let cl = &p1s[wi].cl[s..e];
                 const FAR: usize = 32;
                 const NEAR: usize = 16;
-                for i in 0..cl.len() {
-                    if i + FAR < cl.len() {
-                        pmap.prefetch_bloom(cl[i + FAR].user);
+                // Each user is hashed once: a ring keeps hashes from the far stage.
+                let n = cl.len();
+                let mut ring = [0u64; FAR];
+                for i in 0..FAR.min(n) {
+                    ring[i] = h64(cl[i].user);
+                    pmap.prefetch_bloom_h(ring[i]);
+                }
+                for i in 0..n {
+                    let h = ring[i % FAR];
+                    if i + FAR < n {
+                        let hf = h64(cl[i + FAR].user);
+                        ring[i % FAR] = hf;
+                        pmap.prefetch_bloom_h(hf);
                     }
-                    if i + NEAR < cl.len() {
-                        pmap.prefetch(cl[i + NEAR].user);
+                    if i + NEAR < n {
+                        pmap.prefetch_h(ring[(i + NEAR) % FAR]);
                     }
                     let c = cl[i];
-                    let person = pmap.person(c.user);
-                    let q = (h64(person) >> (64 - NQ_BITS)) as usize;
+                    let (person, ph) = pmap.person_h(c.user, h);
+                    let q = (ph >> (64 - NQ_BITS)) as usize;
                     st.cl.push(q, ClP { person, cid: c.cid, ts: c.ts, camp: c.camp });
                 }
                 PT[4].fetch_add(tt.elapsed().as_nanos() as usize, AO::Relaxed);
