@@ -58,6 +58,7 @@ fn map_file(f: &File, size: u64) -> Option<&'static [u8]> {
     if p as isize == -1 || p.is_null() {
         return None;
     }
+    register_big(p, size as usize);
     Some(unsafe { std::slice::from_raw_parts(p, size as usize) })
 }
 
@@ -870,6 +871,7 @@ impl<T: Copy> Parted<T> {
         if self.used >= self.chunk_bytes {
             // u64 storage: blocks start 8-byte aligned (BLOCK_BYTES is a multiple of 8).
             self.chunks.push(Vec::with_capacity(self.chunk_bytes / 8));
+            register_big(self.chunks.last().unwrap().as_ptr() as *const u8, self.chunk_bytes);
             self.used = 0;
             self.populated = 0;
         }
@@ -1182,6 +1184,40 @@ fn bucket_gather<P, T: Copy>(src: &[P], q: usize, get: impl Fn(&P) -> &Parted<T>
     unsafe { out.set_len(n) };
 }
 
+/// Big regions we own and never free: arena chunks, input mappings, click
+/// buffers. Released in parallel right before exit (`release_memory`).
+static BIG: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+fn register_big(p: *const u8, bytes: usize) {
+    if bytes >= 1 << 20 {
+        BIG.lock().unwrap().push((p as usize, bytes));
+    }
+}
+
+/// MADV_DONTNEED on every registered region (trimmed inward to whole pages,
+/// so allocator headers are untouched), split across `w` threads. Only called
+/// right before exit: nothing may touch that memory afterwards.
+fn release_memory(w: usize) {
+    const PIECE: usize = 8 << 20;
+    let mut pieces: Vec<(usize, usize)> = Vec::new();
+    for &(p, n) in BIG.lock().unwrap().iter() {
+        let a = (p + 4095) & !4095;
+        let b = (p + n) & !4095;
+        let mut s = a;
+        while s < b {
+            let e = (s + PIECE).min(b);
+            pieces.push((s, e - s));
+            s = e;
+        }
+    }
+    run_par(w, pieces.len(), || (), |_, i| {
+        let (a, n) = pieces[i];
+        unsafe {
+            madvise(a as *mut u8, n, 4); // MADV_DONTNEED
+        }
+    });
+}
+
 // ---------------------------------------------------------------- main
 
 struct P1 {
@@ -1433,6 +1469,9 @@ fn main() {
         },
     );
     let pmap = people.into_inner().expect("people built");
+    for p in &p1s {
+        register_big(p.cl.as_ptr() as *const u8, p.cl.capacity() * std::mem::size_of::<ClickRaw>());
+    }
     log("parsed and linked");
 
     // --- phase 2: dedup events, map to people, partition by person
@@ -1727,6 +1766,10 @@ fn main() {
     parquet::write_file(&cd_dir.join("part-0000.parquet"), &cols).expect("write campaign_daily");
     log("done");
     // Skip freeing gigabytes of buffers one by one: the process is finished.
+    // Exit tears memory down on one thread, and the clock runs until it is
+    // done. Release the big regions from all workers in parallel first.
+    release_memory(w);
+    log("memory released");
     std::process::exit(0);
 }
 
