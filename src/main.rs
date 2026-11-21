@@ -833,7 +833,8 @@ trait Rec: Copy + Send + Sync + 'static {
 impl Rec for EvP {
     #[inline(always)]
     fn make(person: u64, ts_rel: u64, price: u32, cat: u16, ph: u64, pk: &Pack) -> Self {
-        EvP { person, ts: ts_rel as i64 + pk.ws, price, cat, bk: bucket_of(ph) }
+        let _ = ph;
+        EvP { person, ts: ts_rel as i64 + pk.ws, price, cat, bk: bucket_cheap(person) }
     }
     #[inline(always)]
     fn person(&self) -> u64 {
@@ -896,7 +897,7 @@ impl Rec for EvP16 {
     }
     #[inline(always)]
     fn bk(&self) -> usize {
-        bucket_of(h64(self.person)) as usize
+        bucket_cheap(self.person) as usize
     }
 }
 
@@ -1260,7 +1261,16 @@ const SUB_BITS: u32 = 12;
 
 /// The bucket of a person inside its phase-3 partition: the hash bits right
 /// below the ones that chose the partition.
+/// Phase-3 sub-bucket of a person: one multiply. Events and clicks must use
+/// the same function; buckets only group records, the final order compares
+/// the real person and time, so collisions never affect results.
 #[inline(always)]
+fn bucket_cheap(person: u64) -> u16 {
+    (person.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - SUB_BITS)) as u16
+}
+
+#[inline(always)]
+#[allow(dead_code)]
 fn bucket_of(person_hash: u64) -> u16 {
     ((person_hash >> (64 - NQ_BITS - SUB_BITS)) & ((1 << SUB_BITS) - 1)) as u16
 }
@@ -1364,6 +1374,7 @@ struct P2<E: Copy> {
     table: Vec<u64>,
 }
 
+#[derive(Default)]
 struct UserRows {
     /// user_id column, PLAIN-encoded.
     name: Vec<u8>,
@@ -1381,11 +1392,13 @@ struct P3<E> {
     list: Vec<u32>,
     catsum: Vec<i64>,
     touched: Vec<u16>,
+    #[allow(dead_code)]
     rows: usize,
     ev: Vec<E>,
     cl: Vec<ClP>,
     counts_ev: Vec<u32>,
     counts_cl: Vec<u32>,
+    out: UserRows,
 }
 
 static PT: [AtomicUsize; 5] = [AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0)];
@@ -1798,7 +1811,7 @@ fn phases23<E: Rec>(a: Phase23, pk: Pack) -> ! {
                     let c = cl[i];
                     let (person, ph) = pmap.person_h(c.user, h);
                     let q = (ph >> (64 - NQ_BITS)) as usize;
-                    st.cl.push(q, ClP { person, cid: c.cid, ts: c.ts, camp: c.camp, bk: bucket_of(ph) });
+                    st.cl.push(q, ClP { person, cid: c.cid, ts: c.ts, camp: c.camp, bk: bucket_cheap(person) });
                 }
                 PT[4].fetch_add(tt.elapsed().as_nanos() as usize, AO::Relaxed);
             }
@@ -1838,6 +1851,7 @@ fn phases23<E: Rec>(a: Phase23, pk: Pack) -> ! {
             cl: Vec::new(),
             counts_ev: Vec::new(),
             counts_cl: Vec::new(),
+            out: UserRows::default(),
         },
         |st, t| {
             if t >= NQ {
@@ -1862,49 +1876,73 @@ fn phases23<E: Rec>(a: Phase23, pk: Pack) -> ! {
                 p.ev.release_partition(q);
                 p.cl.release_partition(q);
             }
-            for w in st.counts_ev.windows(2) {
-                ev[w[0] as usize..w[1] as usize].sort_unstable_by(|a, b| a.person().cmp(&b.person()).then(a.tkey().cmp(&b.tkey())));
-            }
-            for w in st.counts_cl.windows(2) {
-                cl[w[0] as usize..w[1] as usize].sort_unstable_by(|a, b| a.person.cmp(&b.person).then(a.ts.cmp(&b.ts)));
-            }
-            let mut rows = UserRows { name: Vec::new(), day: Vec::new(), sessions: Vec::new(), events: Vec::new(), revenue: Vec::new(), top: Vec::new() };
-            let mut ci = 0usize;
-            let mut i = 0usize;
-            while i < ev.len() {
-                let person = ev[i].person();
-                let mut j = i + 1;
-                while j < ev.len() && ev[j].person() == person {
-                    j += 1;
+            // Bucket by bucket: sort each small bucket exactly by (person, ts),
+            // then join events and clicks of the same person within the bucket.
+            let mut rows = std::mem::take(&mut st.out);
+            let nb = 1usize << SUB_BITS;
+            for b in 0..nb {
+                let (e0, e1) = (st.counts_ev[b] as usize, st.counts_ev[b + 1] as usize);
+                if e0 == e1 {
+                    continue;
                 }
-                let key = (ev[i].bk() as u16, person);
-                while ci < cl.len() && (cl[ci].bk, cl[ci].person) < key {
-                    ci += 1;
+                let (c0, c1) = (st.counts_cl[b] as usize, st.counts_cl[b + 1] as usize);
+                let evb = &mut ev[e0..e1];
+                if evb.len() > 1 {
+                    evb.sort_unstable_by(|a, b| a.person().cmp(&b.person()).then(a.tkey().cmp(&b.tkey())));
                 }
-                let cs = ci;
-                while ci < cl.len() && cl[ci].person == person {
-                    ci += 1;
+                let clb = &mut cl[c0..c1];
+                if clb.len() > 1 {
+                    clb.sort_unstable_by(|a, b| a.person.cmp(&b.person).then(a.ts.cmp(&b.ts)));
                 }
-                walk_person(person, &ev[i..j], &cl[cs..ci], st, ncamp, ndays, day0, &mut rows, &pk);
-                i = j;
+                let mut ci = 0usize;
+                let mut i = 0usize;
+                while i < evb.len() {
+                    let person = evb[i].person();
+                    let mut j = i + 1;
+                    while j < evb.len() && evb[j].person() == person {
+                        j += 1;
+                    }
+                    while ci < clb.len() && clb[ci].person < person {
+                        ci += 1;
+                    }
+                    let cs = ci;
+                    while ci < clb.len() && clb[ci].person == person {
+                        ci += 1;
+                    }
+                    walk_person(person, &evb[i..j], &clb[cs..ci], st, ncamp, ndays, day0, &mut rows, &pk);
+                    i = j;
+                }
             }
+            st.out = rows;
             st.ev = ev;
             st.cl = cl;
-            st.rows += rows.day.len();
-            if !rows.day.is_empty() {
+        },
+    );
+    // user_daily: one file per worker, written in parallel.
+    let mut p3s = p3s;
+    let outs: Vec<UserRows> = p3s.iter_mut().map(|p| std::mem::take(&mut p.out)).collect();
+    let total_rows: usize = outs.iter().map(|r| r.day.len()).sum();
+    std::thread::scope(|sc| {
+        for (i, rows) in outs.into_iter().enumerate() {
+            if rows.day.is_empty() {
+                continue;
+            }
+            let ud_dir = &ud_dir;
+            let cat_names = &cat_names;
+            sc.spawn(move || {
+                let n = rows.day.len();
                 let cols = [
-                    parquet::Column::PlainStr("user_id", rows.name, rows.day.len()),
+                    parquet::Column::PlainStr("user_id", rows.name, n),
                     parquet::Column::I32("day", rows.day, true),
                     parquet::Column::I32("sessions", rows.sessions, false),
                     parquet::Column::I32("events", rows.events, false),
                     parquet::Column::I64("revenue_cents", rows.revenue),
-                    parquet::Column::DictStr("top_category", rows.top, &cat_names),
+                    parquet::Column::DictStr("top_category", rows.top, cat_names),
                 ];
-                parquet::write_file(&ud_dir.join(format!("part-{q:04}.parquet")), &cols).expect("write user_daily");
-            }
-        },
-    );
-    let total_rows: usize = p3s.iter().map(|p| p.rows).sum();
+                parquet::write_file(&ud_dir.join(format!("part-{i:04}.parquet")), &cols).expect("write user_daily");
+            });
+        }
+    });
     if total_rows == 0 {
         let cols = [
             parquet::Column::Str("user_id", vec![]),
