@@ -609,29 +609,45 @@ fn masks64(p: *const u8) -> (u64, u64, u64) {
     }
 }
 
+/// Builds the N fields of one line and calls `on` if the line is well-formed.
+/// `lq` is the number of quotes in the whole line. A field is quoted when its
+/// first and last bytes are both quotes (length >= 2); every other quote makes
+/// the line malformed, which is exactly "quotes only around a whole field".
 #[inline(always)]
-fn finish_line<'a, const N: usize>(buf: &'a [u8], ls: usize, le: usize, nf: usize, ends: &[usize; N], qs: &[u32; N], on: &mut impl FnMut(&[&'a [u8]; N])) {
+fn finish_line<'a, const N: usize>(buf: &'a [u8], ls: usize, le: usize, nf: usize, ends: &[usize; N], lq: u32, on: &mut impl FnMut(&[&'a [u8]; N])) {
     if le == ls || nf != N {
         return;
     }
     let mut f: [&[u8]; N] = [&[]; N];
     let mut s = ls;
+    if lq == 0 {
+        for k in 0..N {
+            let e = ends[k];
+            f[k] = unsafe { buf.get_unchecked(s..e) };
+            s = e + 1;
+        }
+        on(&f);
+        return;
+    }
     let mut ok = true;
+    let mut expected = 0u32;
     for k in 0..N {
         let e = ends[k];
-        let q = qs[k];
-        // A quoted field is valid only as `"..."` with exactly those 2 quotes.
-        let first = unsafe { *buf.get_unchecked(s) };
-        let last = unsafe { *buf.get_unchecked(if e > s { e - 1 } else { s }) };
-        let quoted = q != 0;
-        ok &= !quoted || (q == 2 && e >= s + 2 && first == b'"' && last == b'"');
-        let a = quoted as usize;
-        let lo = s + a;
-        let hi = if e >= lo + a { e - a } else { lo };
+        let (mut lo, mut hi) = (s, e);
+        if e > s {
+            let first = unsafe { *buf.get_unchecked(s) } == b'"';
+            let last = unsafe { *buf.get_unchecked(e - 1) } == b'"';
+            if first || last {
+                ok &= first && last && e >= s + 2;
+                expected += 2;
+                lo = s + 1;
+                hi = if e >= s + 2 { e - 1 } else { lo };
+            }
+        }
         f[k] = unsafe { buf.get_unchecked(lo..hi) };
         s = e + 1;
     }
-    if ok {
+    if ok && expected == lq {
         on(&f);
     }
 }
@@ -642,11 +658,11 @@ fn finish_line<'a, const N: usize>(buf: &'a [u8], ls: usize, le: usize, nf: usiz
 fn scan<'a, const N: usize>(buf: &'a [u8], pos: usize, end: usize, mut on: impl FnMut(&[&'a [u8]; N])) {
     assert!(buf.len() >= end + 64);
     let mut ends = [0usize; N];
-    let mut qs = [0u32; N];
     let mut nf = 0usize;
     let mut line_start = pos;
+    // Quotes seen before the current 64-byte block, and before the current line.
     let mut qbase: u32 = 0;
-    let mut qstart: u32 = 0;
+    let mut qline: u32 = 0;
     let mut base = pos;
     while base < end {
         let (c, n, q) = masks64(unsafe { buf.as_ptr().add(base) });
@@ -656,15 +672,14 @@ fn scan<'a, const N: usize>(buf: &'a [u8], pos: usize, end: usize, mut on: impl 
         while d != 0 {
             let b = d.trailing_zeros();
             let at = base + b as usize;
-            let qc = qbase + (q & ((1u64 << b) - 1)).count_ones();
             if nf < N {
                 ends[nf] = at;
-                qs[nf] = qc - qstart;
             }
             nf += 1;
-            qstart = qc;
             if (n >> b) & 1 == 1 {
-                finish_line::<N>(buf, line_start, at, nf, &ends, &qs, &mut on);
+                let qc = qbase + (q & ((1u64 << b) - 1)).count_ones();
+                finish_line::<N>(buf, line_start, at, nf, &ends, qc - qline, &mut on);
+                qline = qc;
                 line_start = at + 1;
                 nf = 0;
             }
@@ -676,10 +691,73 @@ fn scan<'a, const N: usize>(buf: &'a [u8], pos: usize, end: usize, mut on: impl 
     if line_start < end {
         if nf < N {
             ends[nf] = end;
-            qs[nf] = qbase - qstart;
         }
         nf += 1;
-        finish_line::<N>(buf, line_start, end, nf, &ends, &qs, &mut on);
+        finish_line::<N>(buf, line_start, end, nf, &ends, qbase - qline, &mut on);
+    }
+}
+
+#[cfg(test)]
+mod scan_tests {
+    use super::*;
+
+    /// Every line through the scalar `split` (the reference) and through `scan`.
+    fn both<const N: usize>(text: &[u8]) -> (Vec<Vec<Vec<u8>>>, Vec<Vec<Vec<u8>>>) {
+        let mut want = Vec::new();
+        let mut pos = 0;
+        let mut f: [&[u8]; N] = [&[]; N];
+        while pos < text.len() {
+            let (ok, next) = split::<N>(text, pos, text.len(), &mut f);
+            if ok {
+                want.push(f.iter().map(|x| x.to_vec()).collect());
+            }
+            pos = next;
+        }
+        let mut buf = text.to_vec();
+        buf.resize(text.len() + 64, 0);
+        let mut got = Vec::new();
+        scan::<N>(&buf, 0, text.len(), |f| got.push(f.iter().map(|x| x.to_vec()).collect()));
+        (want, got)
+    }
+
+    #[test]
+    fn scan_matches_scalar_split_on_random_lines() {
+        let alphabet = b"ab,,\"\"\n\r x";
+        let mut seed: u64 = 0x1234_5678;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..200_000 {
+            let len = (next() % 160) as usize;
+            let text: Vec<u8> = (0..len).map(|_| alphabet[(next() % alphabet.len() as u64) as usize]).collect();
+            let (w2, g2) = both::<2>(&text);
+            assert_eq!(w2, g2, "N=2 round {round} text {:?}", String::from_utf8_lossy(&text));
+            let (w4, g4) = both::<4>(&text);
+            assert_eq!(w4, g4, "N=4 round {round} text {:?}", String::from_utf8_lossy(&text));
+            let (w7, g7) = both::<7>(&text);
+            assert_eq!(w7, g7, "N=7 round {round} text {:?}", String::from_utf8_lossy(&text));
+        }
+    }
+
+    #[test]
+    fn scan_edge_cases() {
+        for text in [
+            &b""[..], b"\n", b"a,b", b"a,b\n", b"\"\",\"\"\n", b"\",\"\n", b"\"\"\",x\n", b"a\"b,c\n",
+            b"\"a\",b\r\n", b"\"a,b\n", b"a\",b\n", b"\"\"\"\",b\n", b",\n", b"\"\"\n",
+        ] {
+            let (w, g) = both::<2>(text);
+            assert_eq!(w, g, "{:?}", String::from_utf8_lossy(text));
+        }
+        // Lines spanning several 64-byte blocks, quotes on both sides of a block edge.
+        let mut long = Vec::new();
+        for i in 0..50 {
+            long.extend_from_slice(format!("\"{}\",{}\n", "x".repeat(i * 3), "\"y\"").as_bytes());
+        }
+        let (w, g) = both::<2>(&long);
+        assert_eq!(w, g);
     }
 }
 
