@@ -301,17 +301,83 @@ fn d2(s: &[u8], i: usize) -> Option<i64> {
     }
 }
 
+/// Remembers validated `YYYY-MM-DD` prefixes and their day numbers: a
+/// dataset's timestamps fall on a few weeks of dates, so most lookups hit.
+struct DateCache {
+    keys: [u64; 64],
+    dd: [u16; 64],
+    days: [i64; 64],
+}
+
+const BAD_DATE: i64 = i64::MIN;
+
+impl DateCache {
+    fn new() -> Self {
+        DateCache { keys: [0; 64], dd: [0; 64], days: [0; 64] }
+    }
+    /// Day number of the first 10 bytes of `s` (`YYYY-MM-DD`), or None if
+    /// they are not a valid date. `s` has at least 10 bytes.
+    #[inline(always)]
+    fn days(&mut self, s: &[u8]) -> Option<i64> {
+        let k = u64::from_le_bytes(s[0..8].try_into().unwrap());
+        let d = u16::from_le_bytes(s[8..10].try_into().unwrap());
+        let i = ((k ^ ((d as u64) << 40)).wrapping_mul(0x9E3779B97F4A7C15) >> 58) as usize;
+        if self.keys[i] == k && self.dd[i] == d {
+            let v = self.days[i];
+            return if v == BAD_DATE { None } else { Some(v) };
+        }
+        let v = civil_days(s).unwrap_or(BAD_DATE);
+        self.keys[i] = k;
+        self.dd[i] = d;
+        self.days[i] = v;
+        if v == BAD_DATE {
+            None
+        } else {
+            Some(v)
+        }
+    }
+}
+
+/// Validates `YYYY-MM-DD` and returns its day number.
+fn civil_days(s: &[u8]) -> Option<i64> {
+    if s[4] != b'-' || s[7] != b'-' {
+        return None;
+    }
+    let y = d2(s, 0)? * 100 + d2(s, 2)?;
+    let mo = d2(s, 5)?;
+    let d = d2(s, 8)?;
+    if !(1..=12).contains(&mo) || d < 1 {
+        return None;
+    }
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let dim = match mo {
+        2 => {
+            if leap {
+                29
+            } else {
+                28
+            }
+        }
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if d > dim {
+        return None;
+    }
+    Some(days_from_civil(y, mo, d))
+}
+
 /// Parses F1, F2 or F3 into epoch ms. None for a bad format; a value too
 /// large for i64 becomes i64::MAX (outside every window).
 #[inline]
-fn parse_ts(s: &[u8]) -> Option<i64> {
+fn parse_ts(s: &[u8], dc: &mut DateCache) -> Option<i64> {
     let n = s.len();
     if n == 0 {
         return None;
     }
     if n == 20 || n == 25 {
         if s[4] == b'-' {
-            return parse_civil(s);
+            return parse_civil(s, dc);
         }
     }
     // F3: digits only
@@ -339,35 +405,19 @@ fn parse_ts(s: &[u8]) -> Option<i64> {
     Some(if v > i64::MAX as u64 { i64::MAX } else { v as i64 })
 }
 
-fn parse_civil(s: &[u8]) -> Option<i64> {
+#[inline(always)]
+fn parse_civil(s: &[u8], dc: &mut DateCache) -> Option<i64> {
     let n = s.len();
-    if s[7] != b'-' || s[10] != b'T' || s[13] != b':' || s[16] != b':' {
+    if s[10] != b'T' || s[13] != b':' || s[16] != b':' {
         return None;
     }
-    let y = d2(s, 0)? * 100 + d2(s, 2)?;
-    let mo = d2(s, 5)?;
-    let d = d2(s, 8)?;
     let h = d2(s, 11)?;
     let mi = d2(s, 14)?;
     let se = d2(s, 17)?;
-    if !(1..=12).contains(&mo) || h > 23 || mi > 59 || se > 59 || d < 1 {
+    if h > 23 || mi > 59 || se > 59 {
         return None;
     }
-    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
-    let dim = match mo {
-        2 => {
-            if leap {
-                29
-            } else {
-                28
-            }
-        }
-        4 | 6 | 9 | 11 => 30,
-        _ => 31,
-    };
-    if d > dim {
-        return None;
-    }
+    let days = dc.days(s)?;
     let mut off = 0i64;
     if n == 20 {
         if s[19] != b'Z' {
@@ -389,7 +439,7 @@ fn parse_civil(s: &[u8]) -> Option<i64> {
         }
         off = sign * (oh * 60 + om) * 60_000;
     }
-    Some((days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + se) * 1000 - off)
+    Some((days * 86_400 + h * 3600 + mi * 60 + se) * 1000 - off)
 }
 
 #[inline]
@@ -816,7 +866,7 @@ fn manifest_ts(text: &str, key: &str) -> i64 {
     let q1 = rest.find('"').unwrap();
     let rest = &rest[q1 + 1..];
     let q2 = rest.find('"').unwrap();
-    parse_ts(rest[..q2].as_bytes()).expect("manifest timestamp")
+    parse_ts(rest[..q2].as_bytes(), &mut DateCache::new()).expect("manifest timestamp")
 }
 
 fn list_csv(dir: &Path) -> Vec<(PathBuf, u64)> {
@@ -907,6 +957,7 @@ struct P1 {
     ev: Parted<EvRaw>,
     cl: Vec<ClickRaw>,
     buf: Vec<u8>,
+    dc: DateCache,
 }
 
 struct P2 {
@@ -919,7 +970,8 @@ struct P2 {
 }
 
 struct UserRows {
-    name: Vec<Vec<u8>>,
+    /// user_id column, PLAIN-encoded.
+    name: Vec<u8>,
     day: Vec<i32>,
     sessions: Vec<i32>,
     events: Vec<i32>,
@@ -1044,11 +1096,12 @@ fn main() {
     let p1s = run_par(
         w,
         tasks.len(),
-        || P1 { ev: parted(NP, est_ev * 11 / 10 / w), cl: Vec::with_capacity(est_cl * 11 / 10 / w), buf: Vec::new() },
+        || P1 { ev: parted(NP, est_ev * 11 / 10 / w), cl: Vec::with_capacity(est_cl * 11 / 10 / w), buf: Vec::new(), dc: DateCache::new() },
         |st, t| {
             let (fi, s, e) = tasks[t];
             let (kind, ref file, size, map) = files[fi];
             let mut owned = std::mem::take(&mut st.buf);
+            let dc = &mut st.dc;
             let (buf, pos, end): (&[u8], usize, usize) = match map.and_then(|m| map_chunk(m, s as usize, e as usize).map(|r| (m, r))) {
                 Some((m, (pos, end))) => (m, pos, end),
                 None => {
@@ -1062,7 +1115,7 @@ fn main() {
                         if f[0].is_empty() {
                             return;
                         }
-                        let ingest = match parse_ts(f[3]) {
+                        let ingest = match parse_ts(f[3], dc) {
                             Some(v) => v,
                             None => return,
                         };
@@ -1077,7 +1130,7 @@ fn main() {
                             _ => 255,
                         };
                         if ty != 255 && !f[1].is_empty() && !f[5].is_empty() {
-                            if let Some(v) = parse_ts(f[2]) {
+                            if let Some(v) = parse_ts(f[2], dc) {
                                 if v >= ctx.ws && v < ctx.we && ingest - v <= DAY {
                                     if ty == 2 {
                                         if let Some(p) = parse_price(f[6]) {
@@ -1105,7 +1158,7 @@ fn main() {
                         if f[0].is_empty() || f[1].is_empty() {
                             return;
                         }
-                        let ts = match parse_ts(f[3]) {
+                        let ts = match parse_ts(f[3], dc) {
                             Some(v) if v >= lo && v < ctx.we => v,
                             _ => return,
                         };
@@ -1315,7 +1368,7 @@ fn main() {
             st.rows += rows.day.len();
             if !rows.day.is_empty() {
                 let cols = [
-                    parquet::Column::Str("user_id", rows.name),
+                    parquet::Column::PlainStr("user_id", rows.name, rows.day.len()),
                     parquet::Column::I32("day", rows.day, true),
                     parquet::Column::I32("sessions", rows.sessions, false),
                     parquet::Column::I32("events", rows.events, false),
@@ -1406,7 +1459,8 @@ fn walk_person(person: u64, evs: &[EvP], cls: &[ClP], st: &mut P3, ncamp: usize,
                     st.catsum[c as usize] = 0;
                 }
                 st.touched.clear();
-                rows.name.push(name.clone());
+                rows.name.extend_from_slice(&(name.len() as u32).to_le_bytes());
+                rows.name.extend_from_slice(&name);
                 rows.day.push(cur_day as i32);
                 rows.sessions.push(ds);
                 rows.events.push(de);

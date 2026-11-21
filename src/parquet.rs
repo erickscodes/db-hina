@@ -7,6 +7,8 @@ use std::io::Write;
 pub enum Column<'a> {
     /// Required UTF8 strings.
     Str(&'a str, Vec<Vec<u8>>),
+    /// Required UTF8 strings already PLAIN-encoded (4-byte length + bytes each), and their count.
+    PlainStr(&'a str, Vec<u8>, usize),
     /// Required INT32; `true` marks it as a DATE.
     I32(&'a str, Vec<i32>, bool),
     /// Required INT64.
@@ -18,12 +20,13 @@ pub enum Column<'a> {
 impl Column<'_> {
     fn name(&self) -> &str {
         match self {
-            Column::Str(n, _) | Column::I32(n, _, _) | Column::I64(n, _) | Column::DictStr(n, _, _) => n,
+            Column::Str(n, _) | Column::PlainStr(n, _, _) | Column::I32(n, _, _) | Column::I64(n, _) | Column::DictStr(n, _, _) => n,
         }
     }
     fn len(&self) -> usize {
         match self {
             Column::Str(_, v) => v.len(),
+            Column::PlainStr(_, _, n) => *n,
             Column::I32(_, v, _) => v.len(),
             Column::I64(_, v) => v.len(),
             Column::DictStr(_, v, _) => v.len(),
@@ -183,22 +186,23 @@ pub fn write_file(path: &std::path::Path, cols: &[Column]) -> std::io::Result<()
                     out.extend_from_slice(&body);
                     metas.push(ChunkMeta { ptype: 6, encodings: vec![0, 3], name: n.to_string(), num_values: nrows as i64, size: out.len() as i64 - start, data_off: start, dict_off: None });
                 }
-                Column::I32(n, v, _) => {
-                    let mut body = Vec::with_capacity(v.len() * 4);
-                    for x in v {
-                        body.extend_from_slice(&x.to_le_bytes());
-                    }
+                Column::PlainStr(n, body, _) => {
                     out.extend_from_slice(&page_header(0, body.len(), nrows, 0));
-                    out.extend_from_slice(&body);
+                    out.extend_from_slice(body);
+                    metas.push(ChunkMeta { ptype: 6, encodings: vec![0, 3], name: n.to_string(), num_values: nrows as i64, size: out.len() as i64 - start, data_off: start, dict_off: None });
+                }
+                Column::I32(n, v, _) => {
+                    out.extend_from_slice(&page_header(0, v.len() * 4, nrows, 0));
+                    for x in v {
+                        out.extend_from_slice(&x.to_le_bytes());
+                    }
                     metas.push(ChunkMeta { ptype: 1, encodings: vec![0, 3], name: n.to_string(), num_values: nrows as i64, size: out.len() as i64 - start, data_off: start, dict_off: None });
                 }
                 Column::I64(n, v) => {
-                    let mut body = Vec::with_capacity(v.len() * 8);
+                    out.extend_from_slice(&page_header(0, v.len() * 8, nrows, 0));
                     for x in v {
-                        body.extend_from_slice(&x.to_le_bytes());
+                        out.extend_from_slice(&x.to_le_bytes());
                     }
-                    out.extend_from_slice(&page_header(0, body.len(), nrows, 0));
-                    out.extend_from_slice(&body);
                     metas.push(ChunkMeta { ptype: 2, encodings: vec![0, 3], name: n.to_string(), num_values: nrows as i64, size: out.len() as i64 - start, data_off: start, dict_off: None });
                 }
                 Column::DictStr(n, v, dict) => {
@@ -241,7 +245,7 @@ pub fn write_file(path: &std::path::Path, cols: &[Column]) -> std::io::Result<()
     for c in cols {
         t.ebegin();
         let (ptype, opt, conv, logical) = match c {
-            Column::Str(..) => (6, false, Some(0), Some(1)),
+            Column::Str(..) | Column::PlainStr(..) => (6, false, Some(0), Some(1)),
             Column::I32(_, _, true) => (1, false, Some(6), Some(6)),
             Column::I32(_, _, false) => (1, false, None, None),
             Column::I64(..) => (2, false, None, None),
