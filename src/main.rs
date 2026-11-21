@@ -656,82 +656,112 @@ struct Ctx {
 
 // ---------------------------------------------------------------- partitioned buffers
 
-const BLOCK: u32 = 1024;
+/// Bytes per block. Blocks hold records of one partition.
+const BLOCK_BYTES: usize = 32 << 10;
 
-/// Records appended to many partitions, stored in fixed-size blocks carved
-/// from a few large (huge-page) chunks, so no per-partition vector grows.
+/// Blocks whose records were consumed, ready to be written again: reusing
+/// memory that is already faulted in costs no page faults.
+static POOL: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// Records appended to many partitions, in fixed-size blocks carved from a few
+/// large chunks or taken from `POOL`, so no per-partition vector grows.
 struct Parted<T: Copy> {
-    chunks: Vec<Vec<T>>,
-    chunk_cap: usize,
+    chunks: Vec<Vec<u8>>,
+    chunk_bytes: usize,
     used: usize,
     populated: usize,
-    /// Per partition: the open block (chunk, start, len).
-    cur: Vec<(u32, u32, u32)>,
-    done: Vec<Vec<(u32, u32, u32)>>,
+    spare: Vec<usize>,
+    cap: u32,
+    /// Per partition: the open block and its length (null = none yet).
+    cur: Vec<(*mut T, u32)>,
+    done: Vec<Vec<*mut T>>,
 }
+
+unsafe impl<T: Copy> Send for Parted<T> {}
+unsafe impl<T: Copy> Sync for Parted<T> {}
 
 impl<T: Copy> Parted<T> {
     fn new(parts: usize, expect: usize) -> Self {
-        let chunk_cap = (expect + parts * BLOCK as usize).max(BLOCK as usize * 4).div_ceil(BLOCK as usize) * BLOCK as usize;
-        Parted { chunks: Vec::new(), chunk_cap, used: chunk_cap, populated: 0, cur: vec![(0, 0, BLOCK); parts], done: vec![Vec::new(); parts] }
+        let cap = (BLOCK_BYTES / std::mem::size_of::<T>()) as u32;
+        let blocks = expect.div_ceil(cap as usize) + parts;
+        Parted {
+            chunks: Vec::new(),
+            chunk_bytes: (blocks * BLOCK_BYTES).max(4 * BLOCK_BYTES),
+            used: usize::MAX,
+            populated: 0,
+            spare: Vec::new(),
+            cap,
+            cur: vec![(std::ptr::null_mut(), cap); parts],
+            done: vec![Vec::new(); parts],
+        }
+    }
+    #[cold]
+    fn new_block(&mut self) -> *mut T {
+        if self.spare.is_empty() {
+            let mut g = POOL.lock().unwrap();
+            let take = g.len().min(64);
+            let at = g.len() - take;
+            self.spare.extend(g.drain(at..));
+        }
+        if let Some(b) = self.spare.pop() {
+            return b as *mut T;
+        }
+        if self.used >= self.chunk_bytes {
+            self.chunks.push(Vec::with_capacity(self.chunk_bytes));
+            self.used = 0;
+            self.populated = 0;
+        }
+        let base = self.chunks.last_mut().unwrap().as_mut_ptr();
+        if self.used + BLOCK_BYTES > self.populated {
+            // Fault in the next window with one call instead of page by page.
+            let upto = (self.populated + (4 << 20)).min(self.chunk_bytes);
+            populate(unsafe { base.add(self.populated) }, upto - self.populated, true);
+            self.populated = upto;
+        }
+        let b = unsafe { base.add(self.used) } as *mut T;
+        self.used += BLOCK_BYTES;
+        b
     }
     #[inline(always)]
     fn push(&mut self, p: usize, v: T) {
         let c = unsafe { *self.cur.get_unchecked(p) };
-        if c.2 == BLOCK {
-            if self.used == self.chunk_cap {
-                self.chunks.push(Vec::with_capacity(self.chunk_cap));
-                self.used = 0;
-                self.populated = 0;
+        if c.1 == self.cap {
+            let nb = self.new_block();
+            if !c.0.is_null() {
+                self.done[p].push(c.0);
             }
-            if self.used + BLOCK as usize > self.populated {
-                // Fault in the next window in one call instead of page by page.
-                let window = ((4 << 20) / std::mem::size_of::<T>()).max(BLOCK as usize);
-                let upto = (self.populated + window).min(self.chunk_cap);
-                let base = self.chunks.last().unwrap().as_ptr();
-                let sz = std::mem::size_of::<T>();
-                populate(unsafe { base.add(self.populated) } as *const u8, (upto - self.populated) * sz, true);
-                self.populated = upto;
-            }
-            let nb = ((self.chunks.len() - 1) as u32, self.used as u32, 0);
-            self.used += BLOCK as usize;
-            // u32::MAX marks the initial "no block yet" sentinel.
-            if c.1 != u32::MAX {
-                self.done[p].push(c);
-            }
-            self.cur[p] = nb;
+            self.cur[p] = (nb, 0);
         }
         let c = unsafe { self.cur.get_unchecked_mut(p) };
-        unsafe {
-            self.chunks.get_unchecked_mut(c.0 as usize).as_mut_ptr().add((c.1 + c.2) as usize).write(v);
-        }
-        c.2 += 1;
+        unsafe { c.0.add(c.1 as usize).write(v) };
+        c.1 += 1;
     }
     fn len(&self, p: usize) -> usize {
-        self.done[p].len() * BLOCK as usize + self.open(p).map_or(0, |b| b.2 as usize)
-    }
-    fn open(&self, p: usize) -> Option<(u32, u32, u32)> {
         let c = self.cur[p];
-        if c.1 == u32::MAX {
-            None
-        } else {
-            Some(c)
-        }
+        self.done[p].len() * self.cap as usize + if c.0.is_null() { 0 } else { c.1 as usize }
     }
     fn for_each_slice(&self, p: usize, mut f: impl FnMut(&[T])) {
-        for &(ch, st, n) in self.done[p].iter().chain(self.open(p).iter()) {
-            f(unsafe { std::slice::from_raw_parts(self.chunks[ch as usize].as_ptr().add(st as usize), n as usize) });
+        for &b in &self.done[p] {
+            f(unsafe { std::slice::from_raw_parts(b, self.cap as usize) });
+        }
+        let c = self.cur[p];
+        if !c.0.is_null() {
+            f(unsafe { std::slice::from_raw_parts(c.0, c.1 as usize) });
+        }
+    }
+    /// Hands partition p's blocks to `POOL`. The caller must not read them again.
+    fn recycle(&self, p: usize) {
+        let mut g = POOL.lock().unwrap();
+        g.extend(self.done[p].iter().map(|&b| b as usize));
+        let c = self.cur[p];
+        if !c.0.is_null() {
+            g.push(c.0 as usize);
         }
     }
 }
 
 fn parted<T: Copy>(parts: usize, expect: usize) -> Parted<T> {
-    let mut p = Parted::new(parts, expect);
-    // The sentinel marks "no block yet": start u32::MAX and a full length.
-    for c in p.cur.iter_mut() {
-        *c = (0, u32::MAX, BLOCK);
-    }
-    p
+    Parted::new(parts, expect)
 }
 
 // ---------------------------------------------------------------- parallel helper
@@ -1130,6 +1160,10 @@ fn main() {
                 recs.clear();
                 for p in &p1s {
                     p.ev.for_each_slice(t, |s| recs.extend_from_slice(s));
+                }
+                // Partition t is copied out; its blocks can hold phase-2 output.
+                for p in &p1s {
+                    p.ev.recycle(t);
                 }
                 let n = recs.len();
                 PT[0].fetch_add(tt.elapsed().as_nanos() as usize, AO::Relaxed);
