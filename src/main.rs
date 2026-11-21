@@ -622,17 +622,24 @@ fn finish_line<'a, const N: usize>(buf: &'a [u8], ls: usize, le: usize, nf: usiz
     }
     let mut f: [&[u8]; N] = [&[]; N];
     let mut s = ls;
+    let mut ok = true;
     for k in 0..N {
         let e = ends[k];
-        let fld = &buf[s..e];
-        f[k] = match qs[k] {
-            0 => fld,
-            2 if fld.len() >= 2 && fld[0] == b'"' && fld[fld.len() - 1] == b'"' => &fld[1..fld.len() - 1],
-            _ => return,
-        };
+        let q = qs[k];
+        // A quoted field is valid only as `"..."` with exactly those 2 quotes.
+        let first = unsafe { *buf.get_unchecked(s) };
+        let last = unsafe { *buf.get_unchecked(if e > s { e - 1 } else { s }) };
+        let quoted = q != 0;
+        ok &= !quoted || (q == 2 && e >= s + 2 && first == b'"' && last == b'"');
+        let a = quoted as usize;
+        let lo = s + a;
+        let hi = if e >= lo + a { e - a } else { lo };
+        f[k] = unsafe { buf.get_unchecked(lo..hi) };
         s = e + 1;
     }
-    on(&f);
+    if ok {
+        on(&f);
+    }
 }
 
 /// Calls `on` with the N fields of every well-formed line in buf[pos..end],
@@ -929,6 +936,15 @@ impl People {
         let b = Self::bits(h);
         unsafe { *self.bloom.get_unchecked((h >> self.shift) as usize) & b == b }
     }
+    /// Stage 1, far ahead: bring the Bloom word into cache.
+    #[inline(always)]
+    fn prefetch_bloom(&self, k: u64) {
+        let h = h64(k);
+        unsafe {
+            core::arch::x86_64::_mm_prefetch(self.bloom.as_ptr().add((h >> self.shift) as usize) as *const i8, core::arch::x86_64::_MM_HINT_T0);
+        }
+    }
+    /// Stage 2, nearer: the Bloom word is cached; fetch the table slot if needed.
     #[inline(always)]
     fn prefetch(&self, k: u64) {
         let h = h64(k);
@@ -1342,10 +1358,14 @@ fn main() {
                 }
                 PT[2].fetch_add(tt.elapsed().as_nanos() as usize, AO::Relaxed);
                 let tt = Instant::now();
-                const AHEAD: usize = 24;
+                const FAR: usize = 32;
+                const NEAR: usize = 16;
                 for i in 0..surv.len() {
-                    if i + AHEAD < surv.len() {
-                        pmap.prefetch(surv[i + AHEAD].user);
+                    if i + FAR < surv.len() {
+                        pmap.prefetch_bloom(surv[i + FAR].user);
+                    }
+                    if i + NEAR < surv.len() {
+                        pmap.prefetch(surv[i + NEAR].user);
                     }
                     let r = surv[i];
                     let person = pmap.person(r.user);
@@ -1357,10 +1377,14 @@ fn main() {
                 let tt = Instant::now();
                 let (wi, s, e) = ncl_chunks[t - NP];
                 let cl = &p1s[wi].cl[s..e];
-                const AHEAD: usize = 24;
+                const FAR: usize = 32;
+                const NEAR: usize = 16;
                 for i in 0..cl.len() {
-                    if i + AHEAD < cl.len() {
-                        pmap.prefetch(cl[i + AHEAD].user);
+                    if i + FAR < cl.len() {
+                        pmap.prefetch_bloom(cl[i + FAR].user);
+                    }
+                    if i + NEAR < cl.len() {
+                        pmap.prefetch(cl[i + NEAR].user);
                     }
                     let c = cl[i];
                     let person = pmap.person(c.user);
