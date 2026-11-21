@@ -13,11 +13,12 @@ Read this first if you are picking up the work without the original chat.
 | Commit | What | Scorer time (20M practice) |
 |---|---|---|
 | `2fb8e19` | AVX2 CSV scanner on top of `8dc5783` | **1.66 s** (3rd place at the time; leader 1.52 s) |
+| `<next>` | exact 8-byte IDs (fast path for `[0-9A-Z_a-z]{1,9}`, exact intern table otherwise), dedup prefetch, huge pages off by default | not yet scored (local CPU -22% vs `415479e`; 60M events: ~15 s locally) |
 | Baseline (PySpark starter) | | 171.91 s |
 
 ## Design (src/main.rs, src/parquet.rs) — one dependency-free Rust binary
 - Docker: `rust:1.85-slim-bookworm` build stage, `-C target-cpu=x86-64-v3 -C target-feature=+crt-static`, final image `FROM scratch` (~2.3 MB) → near-instant container start.
-- **Keys:** every ID string <= 15 bytes is packed exactly into a `u128` (bytes big-endian + length in the low byte), so integer order == byte-wise string order and equality is exact. Longer strings fall back to a 120-bit hash (low byte 0xFF) remembered in a side table (`key_bytes`, `key_cmp` handle it). Empty string = 0.
+- **Keys:** every ID becomes an exact `u64`. IDs of 1-9 bytes from `0-9 A-Z _ a-z` (all generator IDs) are packed as 6-bit order-preserving codes + length, so integer order == byte-wise order. Anything else (spaces, ``, quotes, long IDs) gets bit 63 + an index into a global intern table (exact equality; ordering via the strings in `key_cmp`). Empty string = 0.
 - **Phase 1 (parallel parse):** files are split into 8 MB chunks read with `pread`; `scan::<N>` finds commas/newlines/quotes with AVX2 64 bytes at a time and enforces the CSV dialect (exact field count, quotes only around a whole field, empty line malformed, `\r` is data). Events are validated at parse time (validity folded into `user != 0`), stored as 48-byte `EvRaw` records into 256 partitions by hash(event_id) using block arenas (`Parted`). Clicks are validated and stored per worker (click dedup is skipped: copies are identical by rule, so they cannot change any output). Link files are parsed first; the worker that finishes the last link chunk builds the union-find (`build_people`) while others keep parsing.
 - **Phase 2:** per event_id partition: hash-table dedup keeping min ingest (ingest stored as i32 seconds from window start), then map user → person name via `pmap` (prefetched), re-partition events and clicks by hash(person) into 256 partitions.
 - **Phase 3:** per person partition (largest first): sort events (person, ts) and clicks (person, ts); walk each person: sessions (gap > 30 min), day = UTC date of session start, credit = latest click in [start-7d, start] with tie → smallest click_id, assists = distinct campaigns in that window (sliding window with per-campaign counts and an O(1) active list). user_daily rows are written per partition as Parquet; campaign_daily accumulated per worker then merged.
@@ -37,6 +38,8 @@ Helper scripts live in `C:\Users\zevys\Downloads\databricks\wsltools\` (outside 
 ## Local performance notes
 - Local machine (Ryzen 5600G in WSL2) is noisy: the same binary varies 2.2-4.7 s on 20M, and WSL's clocks can disagree. Compare builds by total CPU time (`wsltools/cpu.sh`) and perf profiles, not single wall times.
 - perf profile on 20M (commit `2fb8e19`): phase 2 ~41% (person lookup `Map::get` ~14%, dedup table probing, scatter), phase 1 parse ~35% (`parse_ts` 7%, field extraction ~12%), phase 3 ~15% (sorting ~9%).
+- Huge pages (MADV_HUGEPAGE) made the 60M run 3x slower locally (kernel compaction stalls), so they are off by default (env `HUGE=1` turns them on).
+- Sorting person lookups by table slot (radix-ordered probes) made phase 2 slower; reverted. Prefetching dedup-table slots 16 rows ahead halved dedup time; kept.
 - Tried, no measurable gain: partition block sizes 128/256/1024; huge pages on vs off was within noise (kept on).
 
 ## Ideas not done yet

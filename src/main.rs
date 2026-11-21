@@ -32,7 +32,7 @@ extern "C" {
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
 }
 
-static HUGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static HUGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn advise(p: *mut u8, n: usize) {
     if n >= 4 << 20 && !p.is_null() && HUGE.load(AO::Relaxed) {
@@ -72,57 +72,102 @@ static GLOBAL: HugeAlloc = HugeAlloc;
 
 // ---------------------------------------------------------------- keys
 
-/// Exact 128-bit key for a byte string of up to 15 bytes: the bytes big-endian
-/// in the high 15 bytes (so integer order is byte-wise order), the length in
-/// the low byte. Longer strings get a 120-bit hash with low byte 0xFF and are
-/// remembered in a side table. The empty string is 0.
-static LONG: OnceLock<Mutex<HashMap<u128, Vec<u8>>>> = OnceLock::new();
+/// Every ID becomes a 64-bit key, exactly:
+/// - Up to 9 bytes from `0-9 A-Z _ a-z` (every ID the generator writes): each
+///   byte as a 6-bit code that keeps byte order, left-aligned in bits 62..9,
+///   the length in bits 3..0. Integer order is then byte-wise string order.
+/// - Anything else: bit 63 set and an index into a global intern table, so
+///   equality stays exact; ordering goes through the strings (`key_cmp`).
+/// The empty string is 0.
+const fn code_table() -> [u8; 256] {
+    let mut t = [0u8; 256];
+    let mut c = 1u8;
+    let mut b = 0usize;
+    while b < 256 {
+        let ch = b as u8;
+        if ch.is_ascii_digit() || ch.is_ascii_uppercase() || ch == b'_' || ch.is_ascii_lowercase() {
+            t[b] = c;
+            c += 1;
+        }
+        b += 1;
+    }
+    t
+}
+static CODE: [u8; 256] = code_table();
 
-fn long_table() -> &'static Mutex<HashMap<u128, Vec<u8>>> {
-    LONG.get_or_init(|| Mutex::new(HashMap::new()))
+const fn decode_table() -> [u8; 64] {
+    let code = code_table();
+    let mut d = [0u8; 64];
+    let mut b = 0usize;
+    while b < 256 {
+        let c = code[b];
+        if c != 0 {
+            d[c as usize] = b as u8;
+        }
+        b += 1;
+    }
+    d
+}
+static DECODE: [u8; 64] = decode_table();
+
+const OTHER: u64 = 1 << 63;
+
+struct Interned {
+    ids: HashMap<Vec<u8>, u64>,
+    strings: Vec<Vec<u8>>,
+}
+
+static OTHERS: OnceLock<Mutex<Interned>> = OnceLock::new();
+
+fn others() -> &'static Mutex<Interned> {
+    OTHERS.get_or_init(|| Mutex::new(Interned { ids: HashMap::new(), strings: Vec::new() }))
 }
 
 #[inline(always)]
-fn pack(s: &[u8]) -> u128 {
+fn pack(s: &[u8]) -> u64 {
     let n = s.len();
     if n == 0 {
         return 0;
     }
-    if n <= 15 {
-        let mut k: u128 = 0;
+    if n <= 9 {
+        let mut k: u64 = 0;
         for &b in s {
-            k = (k << 8) | b as u128;
+            let c = CODE[b as usize];
+            if c == 0 {
+                return pack_other(s);
+            }
+            k = (k << 6) | c as u64;
         }
-        (k << (8 * (15 - n) + 8)) | n as u128
+        (k << (6 * (9 - n) + 9)) | n as u64
     } else {
-        pack_long(s)
+        pack_other(s)
     }
 }
 
 #[cold]
-fn pack_long(s: &[u8]) -> u128 {
-    let mut a: u64 = 0xcbf29ce484222325;
-    let mut b: u64 = 0x84222325cbf29ce4;
-    for &c in s {
-        a = (a ^ c as u64).wrapping_mul(0x100000001b3);
-        b = (b ^ c as u64).wrapping_mul(0x00000100000001b3).rotate_left(17) ^ 0x9E3779B97F4A7C15;
+#[inline(never)]
+fn pack_other(s: &[u8]) -> u64 {
+    let mut g = others().lock().unwrap();
+    if let Some(&k) = g.ids.get(s) {
+        return k;
     }
-    let k = (((a as u128) << 64 | b as u128) << 8) | 0xFF;
-    long_table().lock().unwrap().entry(k).or_insert_with(|| s.to_vec());
+    let k = OTHER | g.strings.len() as u64;
+    g.strings.push(s.to_vec());
+    g.ids.insert(s.to_vec(), k);
     k
 }
 
-fn key_bytes(k: u128) -> Vec<u8> {
-    let n = (k & 0xFF) as usize;
-    if n == 0xFF {
-        return long_table().lock().unwrap().get(&k).cloned().unwrap_or_default();
+fn key_bytes(k: u64) -> Vec<u8> {
+    if k & OTHER != 0 {
+        return others().lock().unwrap().strings[(k & !OTHER) as usize].clone();
     }
-    (0..n).map(|i| (k >> (120 - 8 * i)) as u8).collect()
+    let n = (k & 15) as usize;
+    (0..n).map(|i| DECODE[((k >> (57 - 6 * i)) & 63) as usize]).collect()
 }
 
 #[inline]
-fn key_cmp(a: u128, b: u128) -> Ordering {
-    if (a & 0xFF) == 0xFF || (b & 0xFF) == 0xFF {
+fn key_cmp(a: u64, b: u64) -> Ordering {
+    if (a | b) & OTHER != 0 {
         key_bytes(a).cmp(&key_bytes(b))
     } else {
         a.cmp(&b)
@@ -130,17 +175,16 @@ fn key_cmp(a: u128, b: u128) -> Ordering {
 }
 
 #[inline(always)]
-fn h64(k: u128) -> u64 {
-    let x = (k as u64) ^ ((k >> 64) as u64).wrapping_mul(0x9E3779B97F4A7C15);
-    let mut z = x.wrapping_add(0x9E3779B97F4A7C15);
+fn h64(k: u64) -> u64 {
+    let mut z = k.wrapping_add(0x9E3779B97F4A7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
     z ^ (z >> 31)
 }
 
-/// Open-addressing map from non-zero u128 keys.
+/// Open-addressing map from non-zero u64 keys.
 struct Map<V: Copy> {
-    s: Vec<(u128, V)>,
+    s: Vec<(u64, V)>,
     mask: usize,
 }
 
@@ -150,7 +194,7 @@ impl<V: Copy + Default> Map<V> {
         Map { s: vec![(0, V::default()); cap], mask: cap - 1 }
     }
     #[inline(always)]
-    fn get(&self, k: u128) -> Option<V> {
+    fn get(&self, k: u64) -> Option<V> {
         if k == 0 {
             return None;
         }
@@ -167,7 +211,7 @@ impl<V: Copy + Default> Map<V> {
         }
     }
     #[inline(always)]
-    fn prefetch(&self, k: u128) {
+    fn prefetch(&self, k: u64) {
         let i = h64(k) as usize & self.mask;
         unsafe {
             core::arch::x86_64::_mm_prefetch(self.s.as_ptr().add(i) as *const i8, core::arch::x86_64::_MM_HINT_T0);
@@ -175,7 +219,7 @@ impl<V: Copy + Default> Map<V> {
     }
     /// Index of k's slot, inserting it with `V::default()` if absent; true if new.
     #[inline]
-    fn slot(&mut self, k: u128) -> (usize, bool) {
+    fn slot(&mut self, k: u64) -> (usize, bool) {
         let mut i = h64(k) as usize & self.mask;
         loop {
             let kk = self.s[i].0;
@@ -527,23 +571,23 @@ fn scan<'a, const N: usize>(buf: &'a [u8], pos: usize, end: usize, mut on: impl 
 /// high 32 bits and the price in the low 32.
 #[derive(Clone, Copy)]
 struct EvRaw {
-    eid: u128,
-    user: u128,
+    eid: u64,
+    user: u64,
     tsc: u64,
     ip: u64,
 }
 
 #[derive(Clone, Copy)]
 struct ClickRaw {
-    user: u128,
-    cid: u128,
+    user: u64,
+    cid: u64,
     ts: i64,
     camp: u32,
 }
 
 #[derive(Clone, Copy)]
 struct EvP {
-    person: u128,
+    person: u64,
     ts: i64,
     price: u32,
     cat: u16,
@@ -551,8 +595,8 @@ struct EvP {
 
 #[derive(Clone, Copy)]
 struct ClP {
-    person: u128,
-    cid: u128,
+    person: u64,
+    cid: u64,
     ts: i64,
     camp: u32,
 }
@@ -707,10 +751,10 @@ fn list_csv(dir: &Path) -> Vec<(PathBuf, u64)> {
 // ---------------------------------------------------------------- linking
 
 /// Union-find over every linked ID; returns ID -> person name (smallest ID).
-fn build_people(links: &[Vec<(u128, u128)>]) -> Map<u128> {
+fn build_people(links: &[Vec<(u64, u64)>]) -> Map<u64> {
     let npairs: usize = links.iter().map(|l| l.len()).sum();
-    let mut pmap = Map::<u128>::new(npairs + 16);
-    let mut ids: Vec<u128> = Vec::with_capacity(npairs);
+    let mut pmap = Map::<u64>::new(npairs + 16);
+    let mut ids: Vec<u64> = Vec::with_capacity(npairs);
     let mut parent: Vec<u32> = Vec::with_capacity(npairs);
     fn find(parent: &mut [u32], mut x: u32) -> u32 {
         while parent[x as usize] != x {
@@ -726,7 +770,7 @@ fn build_people(links: &[Vec<(u128, u128)>]) -> Map<u128> {
             for (j, k) in [a, b].into_iter().enumerate() {
                 let (s, new) = pmap.slot(k);
                 if new {
-                    pmap.s[s].1 = ids.len() as u128;
+                    pmap.s[s].1 = ids.len() as u64;
                     parent.push(ids.len() as u32);
                     ids.push(k);
                 }
@@ -740,7 +784,7 @@ fn build_people(links: &[Vec<(u128, u128)>]) -> Map<u128> {
         }
     }
     let roots: Vec<u32> = (0..ids.len() as u32).map(|i| find(&mut parent, i)).collect();
-    let mut name: Vec<u128> = ids.clone();
+    let mut name: Vec<u64> = ids.clone();
     for i in 0..ids.len() {
         let r = roots[i] as usize;
         if key_cmp(ids[i], name[r]) == Ordering::Less {
@@ -805,8 +849,10 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, |n| n.get()))
         .max(1);
-    if std::env::var("NOHUGE").is_ok() {
-        HUGE.store(false, AO::Relaxed);
+    // Huge pages are opt-in: on a fragmented machine the kernel stalls compacting
+    // memory for them (60M events: 45 s with, 15 s without, locally).
+    if std::env::var("HUGE").is_ok() {
+        HUGE.store(true, AO::Relaxed);
     }
     let log = |m: &str| eprintln!("[{:7.3}s] {m}", t0.elapsed().as_secs_f64());
 
@@ -881,9 +927,9 @@ fn main() {
     log(&format!("{} files, {} tasks, {} event bytes, {} workers", files.len(), tasks.len(), ev_bytes, w));
 
     // --- phase 1: parse (and link)
-    let links_store: Mutex<Vec<Vec<(u128, u128)>>> = Mutex::new(Vec::new());
+    let links_store: Mutex<Vec<Vec<(u64, u64)>>> = Mutex::new(Vec::new());
     let links_left = AtomicUsize::new(link_tasks);
-    let people: OnceLock<Map<u128>> = OnceLock::new();
+    let people: OnceLock<Map<u64>> = OnceLock::new();
     if link_tasks == 0 {
         let _ = people.set(Map::new(0));
     }
@@ -907,7 +953,7 @@ fn main() {
                             Some(v) => v,
                             None => return,
                         };
-                        let mut user = 0u128;
+                        let mut user = 0u64;
                         let mut price = 0u32;
                         let mut cat = 0u16;
                         let mut ts = 0i64;
@@ -1014,7 +1060,13 @@ fn main() {
                 let keep = &mut st.keep;
                 keep.clear();
                 keep.resize(n, 0);
-                for (i, r) in recs.iter().enumerate() {
+                const DAHEAD: usize = 16;
+                for i in 0..n {
+                    if i + DAHEAD < n {
+                        let hs = h64(recs[i + DAHEAD].eid) as usize & mask;
+                        unsafe { core::arch::x86_64::_mm_prefetch(table.as_ptr().add(hs) as *const i8, core::arch::x86_64::_MM_HINT_T0) };
+                    }
+                    let r = &recs[i];
                     let id = i as u64 + 1;
                     let h = h64(r.eid);
                     let fp = h & 0xFFFF_FFFF_0000_0000;
@@ -1216,7 +1268,7 @@ fn main() {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn walk_person(person: u128, evs: &[EvP], cls: &[ClP], st: &mut P3, ncamp: usize, ndays: usize, day0: i64, rows: &mut UserRows) {
+fn walk_person(person: u64, evs: &[EvP], cls: &[ClP], st: &mut P3, ncamp: usize, ndays: usize, day0: i64, rows: &mut UserRows) {
     let mut lo = 0usize;
     let mut hi = 0usize;
     let mut k = 0usize;
