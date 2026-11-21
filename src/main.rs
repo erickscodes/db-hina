@@ -417,7 +417,106 @@ fn read_chunk(f: &File, size: u64, start: u64, end: u64, buf: &mut Vec<u8>) -> (
         Some(i) => i + 1,
         None => region_end,
     };
+    // 64 bytes of slack so `scan` can load whole 64-byte blocks.
+    let dl = buf.len();
+    buf.resize(dl + 64, 0);
     (pos, region_end)
+}
+
+/// Comma, newline and quote bitmasks of the 64 bytes at `p`.
+#[inline(always)]
+fn masks64(p: *const u8) -> (u64, u64, u64) {
+    #[cfg(target_feature = "avx2")]
+    unsafe {
+        use core::arch::x86_64::*;
+        let a = _mm256_loadu_si256(p as *const __m256i);
+        let b = _mm256_loadu_si256(p.add(32) as *const __m256i);
+        let m = |ch: u8| -> u64 {
+            let v = _mm256_set1_epi8(ch as i8);
+            let lo = _mm256_movemask_epi8(_mm256_cmpeq_epi8(a, v)) as u32 as u64;
+            let hi = _mm256_movemask_epi8(_mm256_cmpeq_epi8(b, v)) as u32 as u64;
+            lo | hi << 32
+        };
+        (m(b','), m(b'\n'), m(b'"'))
+    }
+    #[cfg(not(target_feature = "avx2"))]
+    {
+        let (mut c, mut n, mut q) = (0u64, 0u64, 0u64);
+        for i in 0..64 {
+            let b = unsafe { *p.add(i) };
+            c |= ((b == b',') as u64) << i;
+            n |= ((b == b'\n') as u64) << i;
+            q |= ((b == b'"') as u64) << i;
+        }
+        (c, n, q)
+    }
+}
+
+#[inline(always)]
+fn finish_line<'a, const N: usize>(buf: &'a [u8], ls: usize, le: usize, nf: usize, ends: &[usize; N], qs: &[u32; N], on: &mut impl FnMut(&[&'a [u8]; N])) {
+    if le == ls || nf != N {
+        return;
+    }
+    let mut f: [&[u8]; N] = [&[]; N];
+    let mut s = ls;
+    for k in 0..N {
+        let e = ends[k];
+        let fld = &buf[s..e];
+        f[k] = match qs[k] {
+            0 => fld,
+            2 if fld.len() >= 2 && fld[0] == b'"' && fld[fld.len() - 1] == b'"' => &fld[1..fld.len() - 1],
+            _ => return,
+        };
+        s = e + 1;
+    }
+    on(&f);
+}
+
+/// Calls `on` with the N fields of every well-formed line in buf[pos..end],
+/// finding delimiters 64 bytes at a time. `buf` needs 64 bytes past `end`.
+#[inline(always)]
+fn scan<'a, const N: usize>(buf: &'a [u8], pos: usize, end: usize, mut on: impl FnMut(&[&'a [u8]; N])) {
+    assert!(buf.len() >= end + 64);
+    let mut ends = [0usize; N];
+    let mut qs = [0u32; N];
+    let mut nf = 0usize;
+    let mut line_start = pos;
+    let mut qbase: u32 = 0;
+    let mut qstart: u32 = 0;
+    let mut base = pos;
+    while base < end {
+        let (c, n, q) = masks64(unsafe { buf.as_ptr().add(base) });
+        let lim = if end - base < 64 { (1u64 << (end - base)) - 1 } else { !0 };
+        let (n, q) = (n & lim, q & lim);
+        let mut d = (c & lim) | n;
+        while d != 0 {
+            let b = d.trailing_zeros();
+            let at = base + b as usize;
+            let qc = qbase + (q & ((1u64 << b) - 1)).count_ones();
+            if nf < N {
+                ends[nf] = at;
+                qs[nf] = qc - qstart;
+            }
+            nf += 1;
+            qstart = qc;
+            if (n >> b) & 1 == 1 {
+                finish_line::<N>(buf, line_start, at, nf, &ends, &qs, &mut on);
+                line_start = at + 1;
+                nf = 0;
+            }
+            d &= d - 1;
+        }
+        qbase += q.count_ones();
+        base += 64;
+    }
+    if line_start < end {
+        if nf < N {
+            ends[nf] = end;
+            qs[nf] = qbase - qstart;
+        }
+        nf += 1;
+        finish_line::<N>(buf, line_start, end, nf, &ends, &qs, &mut on);
+    }
 }
 
 // ---------------------------------------------------------------- records
@@ -796,19 +895,16 @@ fn main() {
             let (fi, s, e) = tasks[t];
             let (kind, ref file, size) = files[fi];
             let mut buf = std::mem::take(&mut st.buf);
-            let (mut pos, end) = read_chunk(file, size, s, e, &mut buf);
+            let (pos, end) = read_chunk(file, size, s, e, &mut buf);
             match kind {
                 0 => {
-                    let mut f: [&[u8]; 7] = [&[]; 7];
-                    while pos < end {
-                        let (ok, next) = split::<7>(&buf, pos, end, &mut f);
-                        pos = next;
-                        if !ok || f[0].is_empty() {
-                            continue;
+                    scan::<7>(&buf, pos, end, |f| {
+                        if f[0].is_empty() {
+                            return;
                         }
                         let ingest = match parse_ts(f[3]) {
                             Some(v) => v,
-                            None => continue,
+                            None => return,
                         };
                         let mut user = 0u128;
                         let mut price = 0u32;
@@ -841,39 +937,32 @@ fn main() {
                         let ing = (ingest.div_euclid(1000) - ws_s).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
                         let p = (h64(eid) >> (64 - NP_BITS)) as usize;
                         st.ev.push(p, EvRaw { eid, user, tsc: ts as u64 | (cat as u64) << 48, ip: ((ing as u32 as u64) << 32) | price as u64 });
-                    }
+                    });
                 }
                 1 => {
-                    let mut f: [&[u8]; 4] = [&[]; 4];
                     let lo = ctx.ws - WEEK;
-                    while pos < end {
-                        let (ok, next) = split::<4>(&buf, pos, end, &mut f);
-                        pos = next;
-                        if !ok || f[0].is_empty() || f[1].is_empty() {
-                            continue;
+                    scan::<4>(&buf, pos, end, |f| {
+                        if f[0].is_empty() || f[1].is_empty() {
+                            return;
                         }
                         let ts = match parse_ts(f[3]) {
                             Some(v) if v >= lo && v < ctx.we => v,
-                            _ => continue,
+                            _ => return,
                         };
                         let camp = match ctx.campaigns.get(pack(f[2])) {
                             Some(c) => c,
-                            None => continue,
+                            None => return,
                         };
                         st.cl.push(ClickRaw { user: pack(f[1]), cid: pack(f[0]), ts, camp });
-                    }
+                    });
                 }
                 _ => {
-                    let mut f: [&[u8]; 2] = [&[]; 2];
                     let mut local = Vec::new();
-                    while pos < end {
-                        let (ok, next) = split::<2>(&buf, pos, end, &mut f);
-                        pos = next;
-                        if !ok || f[0].is_empty() || f[1].is_empty() {
-                            continue;
+                    scan::<2>(&buf, pos, end, |f| {
+                        if !f[0].is_empty() && !f[1].is_empty() {
+                            local.push((pack(f[0]), pack(f[1])));
                         }
-                        local.push((pack(f[0]), pack(f[1])));
-                    }
+                    });
                     links_store.lock().unwrap().push(local);
                     if links_left.fetch_sub(1, AO::AcqRel) == 1 {
                         let all = std::mem::take(&mut *links_store.lock().unwrap());
