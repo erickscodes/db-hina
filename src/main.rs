@@ -191,6 +191,53 @@ fn pack(s: &[u8]) -> u64 {
     }
 }
 
+/// `pack`, vectorized for the common case (1-9 bytes from `0-9 A-Z _ a-z`):
+/// all bytes mapped to their 6-bit codes at once, validated with one mask,
+/// and packed with `pext`. Anything else goes through `pack`.
+///
+/// Safety: 16 bytes must be readable from `s.as_ptr()` (true for fields of a
+/// `scan` buffer, which has 64 bytes of slack after the region).
+#[inline(always)]
+unsafe fn pack_fast(s: &[u8]) -> u64 {
+    use core::arch::x86_64::*;
+    let n = s.len();
+    if n == 0 || n > 9 {
+        return pack(s);
+    }
+    let v = _mm_loadu_si128(s.as_ptr() as *const __m128i);
+    let ge = |lo: u8| _mm_cmpgt_epi8(v, _mm_set1_epi8(lo as i8 - 1));
+    let le = |hi: u8| _mm_cmpgt_epi8(_mm_set1_epi8(hi as i8 + 1), v);
+    let digit = _mm_and_si128(ge(b'0'), le(b'9'));
+    let upper = _mm_and_si128(ge(b'A'), le(b'Z'));
+    let lower = _mm_and_si128(ge(b'a'), le(b'z'));
+    let under = _mm_cmpeq_epi8(v, _mm_set1_epi8(b'_' as i8));
+    // codes: digits 1-10, upper 11-36, '_' 37, lower 38-63 (byte order kept)
+    let c = _mm_or_si128(
+        _mm_or_si128(
+            _mm_and_si128(digit, _mm_sub_epi8(v, _mm_set1_epi8((b'0' - 1) as i8))),
+            _mm_and_si128(upper, _mm_sub_epi8(v, _mm_set1_epi8((b'A' - 11) as i8))),
+        ),
+        _mm_or_si128(
+            _mm_and_si128(lower, _mm_sub_epi8(v, _mm_set1_epi8((b'a' - 38) as i8))),
+            _mm_and_si128(under, _mm_set1_epi8(37)),
+        ),
+    );
+    let valid = _mm_or_si128(_mm_or_si128(digit, upper), _mm_or_si128(lower, under));
+    let need = (1u32 << n) - 1;
+    if (_mm_movemask_epi8(valid) as u32) & need != need {
+        return pack(s);
+    }
+    // keep the first n codes, zero the rest
+    let idx = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    let keep = _mm_cmpgt_epi8(_mm_set1_epi8(n as i8), idx);
+    let c = _mm_and_si128(c, keep);
+    let lo = _mm_cvtsi128_si64(c) as u64; // codes 0-7, code 0 in the low byte
+    let c8 = (_mm_extract_epi8::<8>(c) as u64) & 63;
+    let k48 = _pext_u64(lo.swap_bytes(), 0x3F3F_3F3F_3F3F_3F3F); // code 0 highest
+    let k54 = (k48 << 6) | c8;
+    (k54 << 9) | n as u64
+}
+
 #[cold]
 #[inline(never)]
 fn pack_other(s: &[u8]) -> u64 {
@@ -619,36 +666,28 @@ fn finish_line<'a, const N: usize>(buf: &'a [u8], ls: usize, le: usize, nf: usiz
     if le == ls || nf != N {
         return;
     }
+    // Branchless: about one field in five is quoted, at random, so branching
+    // on quotes mispredicts constantly. Field k is quoted iff its first byte
+    // is a quote; then its last byte must be one too and it needs length >= 2.
+    // For an empty field both probes read delimiters (lines start after a
+    // newline, so s >= 1), so it counts as unquoted.
     let mut f: [&[u8]; N] = [&[]; N];
     let mut s = ls;
-    if lq == 0 {
-        for k in 0..N {
-            let e = ends[k];
-            f[k] = unsafe { buf.get_unchecked(s..e) };
-            s = e + 1;
-        }
-        on(&f);
-        return;
-    }
     let mut ok = true;
     let mut expected = 0u32;
     for k in 0..N {
         let e = ends[k];
-        let (mut lo, mut hi) = (s, e);
-        if e > s {
-            let first = unsafe { *buf.get_unchecked(s) } == b'"';
-            let last = unsafe { *buf.get_unchecked(e - 1) } == b'"';
-            if first || last {
-                ok &= first && last && e >= s + 2;
-                expected += 2;
-                lo = s + 1;
-                hi = if e >= s + 2 { e - 1 } else { lo };
-            }
-        }
+        let fq = unsafe { *buf.get_unchecked(s) } == b'"';
+        let lqt = unsafe { *buf.get_unchecked(e.wrapping_sub(1)) } == b'"';
+        ok &= (fq == lqt) & (!fq | (e >= s + 2));
+        let q = fq as usize;
+        expected += 2 * q as u32;
+        let lo = s + q;
+        let hi = (e - q).max(lo);
         f[k] = unsafe { buf.get_unchecked(lo..hi) };
         s = e + 1;
     }
-    if ok && expected == lq {
+    if ok & (expected == lq) {
         on(&f);
     }
 }
@@ -658,6 +697,9 @@ fn finish_line<'a, const N: usize>(buf: &'a [u8], ls: usize, le: usize, nf: usiz
 #[inline(always)]
 fn scan<'a, const N: usize>(buf: &'a [u8], pos: usize, end: usize, mut on: impl FnMut(&[&'a [u8]; N])) {
     assert!(buf.len() >= end + 64);
+    // finish_line peeks at the byte before an empty field: lines must start
+    // after a newline, never at offset 0.
+    assert!(pos >= 1 && (pos >= end || buf[pos - 1] == b'\n'));
     let mut ends = [0usize; N];
     let mut nf = 0usize;
     let mut line_start = pos;
@@ -714,10 +756,12 @@ mod scan_tests {
             }
             pos = next;
         }
-        let mut buf = text.to_vec();
-        buf.resize(text.len() + 64, 0);
+        // As in the pipeline, the scanned region starts right after a newline.
+        let mut buf = vec![b'\n'];
+        buf.extend_from_slice(text);
+        buf.resize(text.len() + 1 + 64, 0);
         let mut got = Vec::new();
-        scan::<N>(&buf, 0, text.len(), |f| got.push(f.iter().map(|x| x.to_vec()).collect()));
+        scan::<N>(&buf, 1, text.len() + 1, |f| got.push(f.iter().map(|x| x.to_vec()).collect()));
         (want, got)
     }
 
@@ -740,6 +784,26 @@ mod scan_tests {
             assert_eq!(w4, g4, "N=4 round {round} text {:?}", String::from_utf8_lossy(&text));
             let (w7, g7) = both::<7>(&text);
             assert_eq!(w7, g7, "N=7 round {round} text {:?}", String::from_utf8_lossy(&text));
+        }
+    }
+
+    #[test]
+    fn pack_fast_matches_pack() {
+        let alphabet: &[u8] = &[b'0', b'9', b'A', b'Z', b'a', b'z', b'_', b'x', b'5', b'Q', b' ', b'-', b'"', b'\r', 0xC3, 0x80, b'/', b'@', b'[', b'`', b'{'];
+        let mut seed: u64 = 99;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..500_000 {
+            let n = (next() % 13) as usize;
+            let text: Vec<u8> = (0..n).map(|_| alphabet[(next() % alphabet.len() as u64) as usize]).collect();
+            let mut buf = text.clone();
+            buf.extend_from_slice(&[b'a'; 16]);
+            let fast = unsafe { pack_fast(&buf[..n]) };
+            assert_eq!(fast, pack(&text), "{:?}", String::from_utf8_lossy(&text));
         }
     }
 
@@ -917,6 +981,76 @@ struct Ctx {
     products: Map<u16>,
     unknown_cat: u16,
     campaigns: Map<u32>,
+}
+
+/// One event row (already split into fields) to its dedup partition and raw
+/// record; None for rows dropped before dedup (empty event_id, unreadable ingest_ts).
+#[inline(always)]
+fn parse_event(f: &[&[u8]; 7], ctx: &Ctx, dc: &mut DateCache) -> Option<(usize, EvRaw)> {
+    if f[0].is_empty() {
+        return None;
+    }
+    let ingest = parse_ts(f[3], dc)?;
+    let mut user = 0u64;
+    let mut price = 0u32;
+    let mut cat = 0u16;
+    let mut ts = 0i64;
+    let ty = match f[4] {
+        b"view" => 0u8,
+        b"cart" => 1,
+        b"purchase" => 2,
+        _ => 255,
+    };
+    if ty != 255 && !f[1].is_empty() && !f[5].is_empty() {
+        if let Some(v) = parse_ts(f[2], dc) {
+            if v >= ctx.ws && v < ctx.we && ingest - v <= DAY {
+                if ty == 2 {
+                    if let Some(p) = parse_price(f[6]) {
+                        price = p;
+                        cat = ctx.products.get(unsafe { pack_fast(f[5]) }).unwrap_or(ctx.unknown_cat);
+                        user = unsafe { pack_fast(f[1]) };
+                        ts = v - ctx.ws;
+                    }
+                } else {
+                    user = unsafe { pack_fast(f[1]) };
+                    ts = v - ctx.ws;
+                }
+            }
+        }
+    }
+    let eid = unsafe { pack_fast(f[0]) };
+    let ing = (ingest.div_euclid(1000) + INGEST_BASE).clamp(0, (1i64 << 40) - 1) as u64;
+    let p = (h64(eid) >> (64 - NP_BITS)) as usize;
+    Some((p, EvRaw { eid, user, tsc: ts as u64 | (cat as u64) << 48, ip: (ing << 24) | price as u64 }))
+}
+
+/// BENCH_PARSE=1: parse the first 8 MB of the largest event file repeatedly
+/// (cache-resident, so it measures instructions, not memory) and print ns/row.
+fn bench_parse(ctx: &Ctx, ev_files: &[(PathBuf, u64)]) -> ! {
+    let (path, size) = ev_files.iter().max_by_key(|f| f.1).expect("an event file").clone();
+    let f = File::open(&path).unwrap();
+    let mut buf = Vec::new();
+    let (pos, end) = read_chunk(&f, size, 0, size.min(8 << 20), &mut buf);
+    let mut dc = DateCache::new();
+    let mut sink = 0u64;
+    let reps = 40;
+    for mode in 0..2 {
+        let t = Instant::now();
+        let mut rows = 0u64;
+        for _ in 0..reps {
+            scan::<7>(&buf, pos, end, |fl| {
+                rows += 1;
+                if mode == 0 {
+                    sink ^= fl[0].len() as u64;
+                } else if let Some((p, r)) = parse_event(fl, ctx, &mut dc) {
+                    sink ^= r.eid ^ r.user ^ r.tsc ^ r.ip ^ p as u64;
+                }
+            });
+        }
+        let ns = t.elapsed().as_nanos() as f64 / rows as f64;
+        eprintln!("BENCH {}: {:.1} ns/row over {} rows (sink {})", if mode == 0 { "scan only" } else { "scan+parse" }, ns, rows, sink & 1);
+    }
+    std::process::exit(0);
 }
 
 // ---------------------------------------------------------------- partitioned buffers
@@ -1543,6 +1677,9 @@ fn main() {
 
     // --- tasks: link files first, so one worker can build the people while the rest parse
     let ev_files = list_csv(&data.join("events"));
+    if std::env::var("BENCH_PARSE").is_ok() {
+        bench_parse(&ctx, &ev_files);
+    }
     let cl_files = list_csv(&data.join("clicks"));
     let ln_files = list_csv(&data.join("links"));
     let mut files: Vec<(u8, File, u64, Option<&'static [u8]>)> = Vec::new();
@@ -1614,44 +1751,9 @@ fn main() {
             match kind {
                 0 => {
                     scan::<7>(&buf, pos, end, |f| {
-                        if f[0].is_empty() {
-                            return;
+                        if let Some((p, r)) = parse_event(f, &ctx, dc) {
+                            st.ev.push(p, r);
                         }
-                        let ingest = match parse_ts(f[3], dc) {
-                            Some(v) => v,
-                            None => return,
-                        };
-                        let mut user = 0u64;
-                        let mut price = 0u32;
-                        let mut cat = 0u16;
-                        let mut ts = 0i64;
-                        let ty = match f[4] {
-                            b"view" => 0u8,
-                            b"cart" => 1,
-                            b"purchase" => 2,
-                            _ => 255,
-                        };
-                        if ty != 255 && !f[1].is_empty() && !f[5].is_empty() {
-                            if let Some(v) = parse_ts(f[2], dc) {
-                                if v >= ctx.ws && v < ctx.we && ingest - v <= DAY {
-                                    if ty == 2 {
-                                        if let Some(p) = parse_price(f[6]) {
-                                            price = p;
-                                            cat = ctx.products.get(pack(f[5])).unwrap_or(ctx.unknown_cat);
-                                            user = pack(f[1]);
-                                            ts = v - ctx.ws;
-                                        }
-                                    } else {
-                                        user = pack(f[1]);
-                                        ts = v - ctx.ws;
-                                    }
-                                }
-                            }
-                        }
-                        let eid = pack(f[0]);
-                        let ing = (ingest.div_euclid(1000) + INGEST_BASE).clamp(0, (1i64 << 40) - 1) as u64;
-                        let p = (h64(eid) >> (64 - NP_BITS)) as usize;
-                        st.ev.push(p, EvRaw { eid, user, tsc: ts as u64 | (cat as u64) << 48, ip: (ing << 24) | price as u64 });
                     });
                 }
                 1 => {
@@ -1664,11 +1766,11 @@ fn main() {
                             Some(v) if v >= lo && v < ctx.we => v,
                             _ => return,
                         };
-                        let camp = match ctx.campaigns.get(pack(f[2])) {
+                        let camp = match ctx.campaigns.get(unsafe { pack_fast(f[2]) }) {
                             Some(c) => c,
                             None => return,
                         };
-                        st.cl.push(0, ClickRaw { user: pack(f[1]), cid: pack(f[0]), ts, camp });
+                        st.cl.push(0, ClickRaw { user: unsafe { pack_fast(f[1]) }, cid: unsafe { pack_fast(f[0]) }, ts, camp });
                     });
                 }
                 _ => {
