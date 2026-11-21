@@ -942,7 +942,17 @@ struct Parted<T: Copy> {
     /// Per partition: the open block and its length (null = none yet).
     cur: Vec<(*mut T, u32)>,
     done: Vec<Vec<*mut T>>,
+    /// Software write-combining: one 64-byte line per partition. Full lines go
+    /// to the block with non-temporal stores (no read-for-ownership of the
+    /// destination). `per` records fill a line; 0 disables staging.
+    stage: Vec<Line>,
+    staged: Vec<u8>,
+    per: u32,
 }
+
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+struct Line([u8; 64]);
 
 unsafe impl<T: Copy> Send for Parted<T> {}
 unsafe impl<T: Copy> Sync for Parted<T> {}
@@ -960,6 +970,45 @@ impl<T: Copy> Parted<T> {
             cap,
             cur: vec![(std::ptr::null_mut(), cap); parts],
             done: vec![Vec::new(); parts],
+            stage: vec![Line([0; 64]); parts],
+            staged: vec![0; parts],
+            per: {
+                let sz = std::mem::size_of::<T>();
+                if 64 % sz == 0 && sz >= 8 && std::mem::align_of::<T>() <= 8 { (64 / sz) as u32 } else { 0 }
+            },
+        }
+    }
+    /// Makes room for `n` more records in partition p's open block.
+    #[inline(always)]
+    fn room(&mut self, p: usize, n: u32) {
+        let c = unsafe { *self.cur.get_unchecked(p) };
+        if c.0.is_null() || c.1 + n > self.cap {
+            let nb = self.new_block();
+            if !c.0.is_null() {
+                self.done[p].push(c.0);
+            }
+            self.cur[p] = (nb, 0);
+        }
+    }
+    /// Writes the staged records of every partition with ordinary stores.
+    /// Must run before anyone reads the blocks (after the writer's `sfence`).
+    fn finish(&mut self) {
+        if self.per == 0 {
+            return;
+        }
+        let sz = std::mem::size_of::<T>();
+        for p in 0..self.staged.len() {
+            let n = self.staged[p] as u32;
+            if n == 0 {
+                continue;
+            }
+            self.room(p, n);
+            let c = self.cur[p];
+            unsafe {
+                std::ptr::copy_nonoverlapping(self.stage[p].0.as_ptr(), c.0.add(c.1 as usize) as *mut u8, n as usize * sz);
+            }
+            self.cur[p].1 += n;
+            self.staged[p] = 0;
         }
     }
     #[cold]
@@ -996,6 +1045,31 @@ impl<T: Copy> Parted<T> {
     }
     #[inline(always)]
     fn push(&mut self, p: usize, v: T) {
+        if self.per != 0 {
+            let sz = std::mem::size_of::<T>();
+            let k = unsafe { *self.staged.get_unchecked(p) } as usize;
+            unsafe {
+                (self.stage.get_unchecked_mut(p).0.as_mut_ptr().add(k * sz) as *mut T).write_unaligned(v);
+            }
+            if k as u32 + 1 < self.per {
+                unsafe { *self.staged.get_unchecked_mut(p) = k as u8 + 1 };
+                return;
+            }
+            // A full line: stream it to the block (blocks are page-aligned and
+            // lines never straddle a block, so the destination is 64-aligned).
+            self.room(p, self.per);
+            let c = unsafe { self.cur.get_unchecked_mut(p) };
+            unsafe {
+                use core::arch::x86_64::*;
+                let src = self.stage.get_unchecked(p).0.as_ptr() as *const __m256i;
+                let dst = c.0.add(c.1 as usize) as *mut __m256i;
+                _mm256_stream_si256(dst, _mm256_load_si256(src));
+                _mm256_stream_si256(dst.add(1), _mm256_load_si256(src.add(1)));
+            }
+            c.1 += self.per;
+            unsafe { *self.staged.get_unchecked_mut(p) = 0 };
+            return;
+        }
         let c = unsafe { *self.cur.get_unchecked(p) };
         if c.1 == self.cap {
             let nb = self.new_block();
@@ -1075,6 +1149,8 @@ fn run_par<S: Send, I: Fn() -> S + Sync, F: Fn(&mut S, usize) + Sync>(w: usize, 
                         }
                         f(&mut s, t);
                     }
+                    // Order this thread's non-temporal stores before the join.
+                    unsafe { core::arch::x86_64::_mm_sfence() };
                     s
                 })
             })
@@ -1611,6 +1687,10 @@ fn main() {
             st.buf = owned;
         },
     );
+    let mut p1s = p1s;
+    for p in p1s.iter_mut() {
+        p.ev.finish();
+    }
     let pmap = people.into_inner().expect("people built");
     let map_pieces = pieces_of(&MAPS.lock().unwrap());
     // Raw click buffers are dead after phase 2; released during phase 3.
@@ -1817,6 +1897,11 @@ fn phases23<E: Rec>(a: Phase23, pk: Pack) -> ! {
             }
         },
     );
+    let mut p2s = p2s;
+    for p in p2s.iter_mut() {
+        p.ev.finish();
+        p.cl.finish();
+    }
     std::mem::forget(p1s);
     std::mem::forget(pmap);
     log(&format!("deduped and partitioned; thread-ms gather {} dedup {} surv {} map+push {} clicks {}", PT[0].load(AO::Relaxed)/1000000, PT[1].load(AO::Relaxed)/1000000, PT[2].load(AO::Relaxed)/1000000, PT[3].load(AO::Relaxed)/1000000, PT[4].load(AO::Relaxed)/1000000));
